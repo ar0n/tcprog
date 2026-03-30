@@ -1,0 +1,76 @@
+{
+    "name": "tc29x",
+    "family": "tc2xx",
+    "aliases": [
+        "tc297",
+        "tc298",
+        "tc299",
+        "tc29b"
+    ],
+    "chipid_addr": "0xF0036140",
+    "chipid": null,
+    "chipid_mask": "0xFFFFF000",
+    "memory": [
+        {
+            "name": "pflash",
+            "kind": "pflash",
+            "base": "0xA0000000",
+            "size": "0x800000",
+            "_note": "PFLASH (uncached), contiguous across banks"
+        },
+        {
+            "name": "pflash_c",
+            "kind": "pflash",
+            "base": "0x80000000",
+            "size": "0x800000",
+            "_note": "cached alias of pflash"
+        },
+        {
+            "name": "dflash0",
+            "kind": "dflash",
+            "base": "0xAF000000",
+            "size": "0xC0000",
+            "_note": "DF0 EEPROM"
+        },
+        {
+            "name": "ucb",
+            "kind": "ucb",
+            "base": "0xAF100000",
+            "size": "0x4000",
+            "_note": "UCB block, 1G stride 0x400. NEVER write without --confirm-ucb."
+        },
+        {
+            "name": "dflash_hsm",
+            "kind": "dflash",
+            "base": "0xAF110000",
+            "size": "0x10000",
+            "_note": "HSM DFLASH"
+        },
+        {
+            "name": "psram0",
+            "kind": "psram",
+            "base": "0xC0000000",
+            "size": "0x6000",
+            "_note": "CPU0 PSPR; BSL loads stage 1 here (size is a family default)"
+        },
+        {
+            "name": "dsram0",
+            "kind": "dsram",
+            "base": "0xD0000000",
+            "size": "0x1C000",
+            "_note": "CPU0 DSPR; payload stack+CSA (size is a family default)"
+        }
+    ],
+    "bsl_load": "0xC0000000",
+    "asclin_flags": "0xF0000634",
+    "asclin_flagsclear": "0xF000063C",
+    "asclin_txdata": "0xF0000644",
+    "asclin_rxdata": "0xF0000648",
+    "wdt_cpu0con0": "0xF0036100",
+    "wdt_safcon0": "0xF00360F0",
+    "proconpf": null,
+    "procondf": null,
+    "procondbg": "0xF8002058",
+    "hf_protect": null,
+    "_notes": "Harvested from iLLD tc2xx (IfxFlash_cfg.h). 1G: WDT moved vs 2G; flash protection is the FLASH0 module (no DMU_HF_PROTECT/RPRO); proconpf/hf_protect null."
+}

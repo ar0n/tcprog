@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcprog"
+version = "0.1.0"
+description = "AURIX TC2xx/TC3xx flash programmer over an FTDI-MPSSE DAP or ASC BSL"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Aron Szabo", email = "aron@aron.ws"}]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Embedded Systems",
+]
+dependencies = [
+    "bincopy",          # firmware image parsing (SREC/HEX/ELF/bin/TI-TXT)
+]
+
+[project.optional-dependencies]
+# The transports need system bindings, kept optional so list/chips/dry-run work bare:
+dap = ["ftdi1"]         # libftdi1 Python binding, for the FTDI-MPSSE DAP
+bsl = ["pyserial"]      # for the ASC BSL serial transport
+
+[project.scripts]
+tcprog = "tcprog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tcprog*"]
+
+[tool.setuptools.package-data]
+tcprog = ["devices/*.json"]

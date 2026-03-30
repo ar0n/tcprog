@@ -1,0 +1,45 @@
+{
+    "name": "tc4dx",
+    "family": "tc4xx",
+    "aliases": [
+        "tc4d"
+    ],
+    "chipid_addr": null,
+    "chipid": null,
+    "chipid_mask": "0xFFFFF000",
+    "memory": [
+        {
+            "name": "pflash",
+            "kind": "pflash",
+            "base": "0xA0000000",
+            "size": "0x1400000",
+            "_note": "PFLASH (uncached), contiguous across banks"
+        },
+        {
+            "name": "pflash_c",
+            "kind": "pflash",
+            "base": "0x80000000",
+            "size": "0x1400000",
+            "_note": "cached alias of pflash"
+        },
+        {
+            "name": "dflash0",
+            "kind": "dflash",
+            "base": "0xAE000000",
+            "size": "0x100000",
+            "_note": "DF0 EEPROM"
+        }
+    ],
+    "bsl_load": "0xC0000000",
+    "asclin_flags": "0xF46C012C",
+    "asclin_flagsclear": "0xF46C0134",
+    "asclin_txdata": null,
+    "asclin_rxdata": null,
+    "wdt_cpu0con0": null,
+    "wdt_safcon0": null,
+    "proconpf": null,
+    "procondf": null,
+    "procondbg": null,
+    "hf_protect": null,
+    "_notes": "Harvested from iLLD tc4xx (IfxFlash_cfg_TC4Dx.h). 3G (TC4Dx): registers + flash sizes only; UCB/CFS/scratchpad map and BSL payload NOT developed - verify from the TC4xx UM."
+}
