@@ -41,7 +41,7 @@ class FlashProfile:
     """
     def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
                  reject_mask, clre, clre_clear_all, status, wait,
-                 load_lo, load_hi):
+                 load_lo, load_hi, dflash_hi, dflash_sector):
         self.cmd_base = cmd_base
         self.errsr = errsr
         self.errsr_name = errsr_name
@@ -56,6 +56,11 @@ class FlashProfile:
         # TC3xx takes lo at 0x55F0 then hi at 0x55F4; TC4 streams both to 0x55F4.
         self.load_lo = load_lo
         self.load_hi = load_hi
+        # DFLASH lives at a family-specific base (TC3xx 0xAFxxxxxx, TC4 0xAExxxxxx)
+        # with its own logical-sector size (TC3xx 4 KiB, TC4 2 KiB). PFLASH is
+        # 0x80/0xA0 and 16 KiB on both; DFLASH page is 8 B on both.
+        self.dflash_hi = dflash_hi              # high byte of a DFLASH address
+        self.dflash_sector = dflash_sector
 
 
 # TC3xx 2G DMU (Infra/Sfr IfxDmu_regdef.h): HF_* registers. EVER bit4, PVER
@@ -65,7 +70,8 @@ PROFILE_TC3XX = FlashProfile(
     errsr=0xF8040034, errsr_name="HF_ERRSR", ever_bit=4, pver_bit=3,
     reject_mask=(1 << 0) | (1 << 1) | (1 << 2),
     clre=0xF8040038, clre_clear_all=(1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
-    status=0xF8040010, wait="busy", load_lo=0x55F0, load_hi=0x55F4)
+    status=0xF8040010, wait="busy", load_lo=0x55F0, load_hi=0x55F4,
+    dflash_hi=0xAF, dflash_sector=0x1000)
 
 # TC4Dx DMU (Infra/Sfr/TC4Dx IfxDmu_reg.h + IfxDmu_bf.h): HCI_* registers.
 # Command base 0xF8080000 (IfxFlash_cfg_TC4Dx.h IFXFLASH_CMD_BASE_ADDRESS).
@@ -78,7 +84,8 @@ PROFILE_TC4XX = FlashProfile(
     reject_mask=(1 << 16) | (1 << 1) | (1 << 2),
     clre=0xF8040014,
     clre_clear_all=(1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
-    status=0xF8040004, wait="reqdone", load_lo=0x55F4, load_hi=0x55F4)
+    status=0xF8040004, wait="reqdone", load_lo=0x55F4, load_hi=0x55F4,
+    dflash_hi=0xAE, dflash_sector=0x800)
 
 FLASH_PROFILES = {"tc3xx": PROFILE_TC3XX, "tc4xx": PROFILE_TC4XX}
 
@@ -127,12 +134,34 @@ def _is_pflash(addr):
     return (addr & 0xFF000000) in (0x80000000, 0xA0000000)
 
 
+def _is_dflash(addr, p):
+    """True if addr is in this family's DFLASH window (TC3xx 0xAFxxxxxx, TC4
+    0xAExxxxxx)."""
+    return (addr >> 24) == p.dflash_hi
+
+
+def _sector_size(addr, p):
+    """Logical-sector size for the flash addr lives in: 16 KiB PFLASH, the
+    family's DFLASH sector for DFLASH, or None if addr is neither."""
+    if _is_pflash(addr):
+        return PFLASH_LOG_SECTOR
+    if _is_dflash(addr, p):
+        return p.dflash_sector
+    return None
+
+
+def _flash_sectors(addr, length, sector):
+    """(first_sector_addr, count) of the logical sectors of size `sector` that
+    cover [addr, addr+length)."""
+    first = addr & ~(sector - 1)
+    last = (addr + length - 1) & ~(sector - 1)
+    return first, (last - first) // sector + 1
+
+
 def _pflash_sectors(addr, length):
     """(first_sector_addr, count) of the 16 KiB PFLASH logical sectors that cover
     [addr, addr+length)."""
-    first = addr & ~(PFLASH_LOG_SECTOR - 1)
-    last = (addr + length - 1) & ~(PFLASH_LOG_SECTOR - 1)
-    return first, (last - first) // PFLASH_LOG_SECTOR + 1
+    return _flash_sectors(addr, length, PFLASH_LOG_SECTOR)
 
 
 class Flash:
@@ -187,9 +216,9 @@ class Flash:
 
     def enter_page_mode(self, page_addr):
         page_addr = _prog_alias(page_addr)
-        if (page_addr & 0xFF000000) == 0xA0000000:
+        if _is_pflash(page_addr):
             self._cmd(0x5554, 0x50)                 # program flash
-        elif (page_addr & 0xFF000000) == 0xAF000000:
+        elif _is_dflash(page_addr, self.p):
             self._cmd(0x5554, 0x5D)                 # data flash
         else:
             raise DapError("0x%08X is not a programmable flash page" % page_addr)
@@ -423,16 +452,17 @@ def _program(dap, image, args, family="tc3xx"):
 
     if args.erase == "sectors":
         for segment in image.segments:
-            if not _is_pflash(segment.addr):
-                return _error("--erase sectors only supports PFLASH; use --erase none "
+            sector = _sector_size(segment.addr, flash.p)
+            if sector is None:
+                return _error("--erase sectors only supports P/DFLASH; use --erase none "
                              "for 0x%08X" % segment.addr, os.EX_USAGE)
-            first, count = _pflash_sectors(segment.addr, len(segment.data))
+            first, count = _flash_sectors(segment.addr, len(segment.data), sector)
             log("tcprog: erase %d sector(s) from 0x%08X" % (count, first), verbose=True)
             flash.erase_sectors(first, count)
             flash._wait_cmd_done(segment.addr)
 
     for segment in image.segments:
-        page = PFLASH_PAGE if _busy_mask(segment.addr) != 0x01 else DFLASH_PAGE
+        page = DFLASH_PAGE if _is_dflash(segment.addr, flash.p) else PFLASH_PAGE
         data, base = segment.data, segment.addr & ~(page - 1)
         pad_front = segment.addr - base
         buf = b"\xFF" * pad_front + data

@@ -13,10 +13,10 @@ from . import __version__ as VERSION
 from .chips import all_chips, by_chipid, chipid_addrs, _resolve_chip
 from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
                   _locked, _unlock_failed_msg)
-from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _is_pflash,
-                    _pflash_sectors, _program, _read_ucbs, blank_map, bmhd_blocks,
-                    read_region_blankcheck,
-                    read_region_sparse, read_words)
+from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _flash_sectors,
+                    _is_dflash, _is_pflash, _pflash_sectors, _program, _read_ucbs,
+                    _sector_size, blank_map, bmhd_blocks, profile_for_family,
+                    read_region_blankcheck, read_region_sparse, read_words)
 from .image import load_image, _emit, _hexdump, _out_format
 from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
 
@@ -810,14 +810,16 @@ def _cmd_erase(args):
         addr, length, whole = seg.base, seg.size, True
     if addr is None or length is None:
         return _error("erase needs --addr and --length, or --region", os.EX_USAGE)
-    if not _is_pflash(addr):
-        return _error("erase currently supports PFLASH only", os.EX_USAGE)
+    fam = chip.family if chip.family == "tc4xx" else "tc3xx"
+    sector = _sector_size(addr, profile_for_family(fam))
+    if sector is None:
+        return _error("erase supports PFLASH and DFLASH only", os.EX_USAGE)
     if whole and not args.allow_erase_all:
         return _error("erasing the whole %s region needs --allow-erase-all" % args.region,
                       EX_REFUSED)
 
-    first, count = _pflash_sectors(addr, length)
-    end = first + count * PFLASH_LOG_SECTOR
+    first, count = _flash_sectors(addr, length, sector)
+    end = first + count * sector
     if not args.yes:
         sys.stderr.write("tcprog: about to ERASE %d sector(s), 0x%08X..0x%08X on %s.\n"
                          "  This cannot be undone.\n" % (count, first, end, chip.name))
@@ -837,7 +839,6 @@ def _cmd_erase(args):
         except Fail as f:
             return _error(f, f.code)
         try:
-            fam = chip.family if chip.family == "tc4xx" else "tc3xx"
             flash = Flash(dap, fam)
             flash.clear_status()
             log("tcprog: erasing %d sector(s) from 0x%08X..." % (count, first), verbose=True)
