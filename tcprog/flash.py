@@ -249,11 +249,18 @@ class Flash:
 
 
 def _read_region(dap, addr, length):
-    """Block-read [addr, addr+length) and slice out the exact bytes."""
-    start = addr & ~(Dap.BLOCK - 1)
-    end = (addr + length + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1)
-    data = dap.read_blocks(list(range(start, end, Dap.BLOCK)))
-    return data[addr - start: addr - start + length]
+    """Read exactly [addr, addr+length), never past the end: over-reading the
+    erased tail of a partly-programmed block traps on TC3xx. Batch the whole
+    blocks that fit, read the ragged ends word by word."""
+    end = addr + length
+    lo = (addr + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1)   # first block fully inside
+    hi = end & ~(Dap.BLOCK - 1)                       # end of the last such block
+    if lo >= hi:
+        return read_words(dap, addr, length)[:length]
+    out = read_words(dap, addr, lo - addr)
+    out += dap.read_blocks(list(range(lo, hi, Dap.BLOCK)))
+    out += read_words(dap, hi, end - hi)
+    return bytes(out)[:length]
 
 
 def read_region_sparse(dap, addr, length, group=16, on_progress=None):
