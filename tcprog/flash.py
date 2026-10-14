@@ -14,10 +14,78 @@ from .dap import Dap, DapError
 from .image import parse_bmhd, parse_bmhd_tc4, validate_bmhd, validate_bmhd_tc4
 from .util import EX_VERIFY, Fail, _error, log
 
-FSI_BASE = 0xAF000000
-DMU_HF_STATUS = 0xF8040010          # busy bits: D0=bit0, P0=bit2, P1=bit3
+FSI_BASE = 0xAF000000               # TC3xx command base (back-compat default)
+
+# FSI second-cycle opcodes. SAFETY: Verify-Erased is one nibble from Erase.
+# 0x5F = Verify Erased Logical Sector Range (non-destructive, array unchanged).
+# 0x50 = Erase Logical Sector Range (DESTRUCTIVE). Never confuse the two.
+FSI_ERASE_CYCLE2 = 0x50
+FSI_VERIFY_ERASED_CYCLE2 = 0x5F
 PFLASH_PAGE, DFLASH_PAGE = 32, 8    # IFXFLASH_{PFLASH,DFLASH}_PAGE_LENGTH
-PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (192 x 2 over 6 MB)
+PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (TC3xx 6 MB / TC4 20 MB)
+
+# TC4 HCI_STATUS completion handshake (IfxFlash_isRequestReceived/Executed).
+HCI_REQACK, HCI_REQDONE = 1 << 30, 1 << 31
+
+
+class FlashProfile:
+    """Per-family parameters for the FSI command interface and its DMU status/
+    error registers. The command *sequences* are byte-identical across TC3xx and
+    TC4 (verbatim from iLLD IfxFlash.h); only the command base, the DMU register
+    map, the EVER/PVER bit positions, and the completion-wait style differ. This
+    captures exactly those, so one Flash driver covers both families.
+
+    wait: "busy" polls the per-bank busy bits in the status register (TC3xx 2G
+    DMU HF_STATUS); "reqdone" waits on the REQACK->REQDONE handshake in TC4's
+    HCI_STATUS, the sequence the TC4 iLLD itself uses after a command.
+    """
+    def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
+                 reject_mask, clre, clre_clear_all, status, wait):
+        self.cmd_base = cmd_base
+        self.errsr = errsr
+        self.errsr_name = errsr_name
+        self.ever = 1 << ever_bit
+        self.pver = 1 << pver_bit
+        self.reject_mask = reject_mask          # OPER | SQER | PROER (a reject, not an answer)
+        self.clre = clre
+        self.clre_clear_all = clre_clear_all
+        self.status = status
+        self.wait = wait
+
+
+# TC3xx 2G DMU (Infra/Sfr IfxDmu_regdef.h): HF_* registers. EVER bit4, PVER
+# bit3; OPER/SQER/PROER are bits 0/1/2. Verified on TC375 silicon.
+PROFILE_TC3XX = FlashProfile(
+    cmd_base=0xAF000000,
+    errsr=0xF8040034, errsr_name="HF_ERRSR", ever_bit=4, pver_bit=3,
+    reject_mask=(1 << 0) | (1 << 1) | (1 << 2),
+    clre=0xF8040038, clre_clear_all=(1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
+    status=0xF8040010, wait="busy")
+
+# TC4Dx DMU (Infra/Sfr/TC4Dx IfxDmu_reg.h + IfxDmu_bf.h): HCI_* registers.
+# Command base 0xF8080000 (IfxFlash_cfg_TC4Dx.h IFXFLASH_CMD_BASE_ADDRESS).
+# HCI_ERR @0xF8040010: EVER bit7, PVER bit6, OPER bit16, SQER bit1, PROER bit2.
+# HCI_CLRERR @0xF8040014 clears CADER..CEVER. HCI_STATUS @0xF8040004 carries the
+# REQACK/REQDONE handshake. Command sequences are identical to TC3xx.
+PROFILE_TC4XX = FlashProfile(
+    cmd_base=0xF8080000,
+    errsr=0xF8040010, errsr_name="HCI_ERR", ever_bit=7, pver_bit=6,
+    reject_mask=(1 << 16) | (1 << 1) | (1 << 2),
+    clre=0xF8040014,
+    clre_clear_all=(1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
+    status=0xF8040004, wait="reqdone")
+
+FLASH_PROFILES = {"tc3xx": PROFILE_TC3XX, "tc4xx": PROFILE_TC4XX}
+
+
+def profile_for_family(family):
+    """The FSI/DMU profile for a device family. TC2xx is not covered (FLASH0 FSR
+    layout differs); callers gate on that before asking."""
+    try:
+        return FLASH_PROFILES[family]
+    except KeyError:
+        raise DapError("no flash profile for family %r (blank-check covers "
+                       "tc3xx and tc4xx)" % family)
 
 # UCB (User Configuration Block) layout. Block N sits at <ucb_base> + N*stride;
 # its confirmation word is at block + 0x1F0. Block indices are the DMU
@@ -63,12 +131,17 @@ def _pflash_sectors(addr, length):
 
 
 class Flash:
-    """The iLLD FSI command sequences over a Dap. Writes to flash; destructive."""
-    def __init__(self, dap):
+    """The iLLD FSI command sequences over a Dap. Writes to flash; destructive.
+
+    `family` selects the per-family register profile (command base, DMU status/
+    error map, EVER/PVER bits, wait style). Defaults to TC3xx so existing callers
+    are unchanged; pass "tc4xx" to drive a TC4 part's HCI command interface."""
+    def __init__(self, dap, family="tc3xx"):
         self.dap = dap
+        self.p = profile_for_family(family)
 
     def _cmd(self, offset, value):
-        self.dap.write_word(FSI_BASE | offset, value)
+        self.dap.write_word(self.p.cmd_base | offset, value)
 
     def clear_status(self):
         self._cmd(0x5554, 0xFA)
@@ -80,13 +153,32 @@ class Flash:
         import time
         deadline = time.monotonic() + timeout
         while True:
-            status = self.dap.try_read_word(DMU_HF_STATUS)
+            status = self.dap.try_read_word(self.p.status)
             if status is None:
-                raise DapError("HF_STATUS unreadable during flash op")
+                raise DapError("flash status register unreadable during flash op")
             if not (status & mask):
                 return
             if time.monotonic() > deadline:
-                raise DapError("flash busy past %.1fs (HF_STATUS=0x%08X)" % (timeout, status))
+                raise DapError("flash busy past %.1fs (status=0x%08X)" % (timeout, status))
+
+    def _wait_cmd_done(self, addr, timeout=5.0):
+        """Wait for one FSI command to complete. TC3xx polls the per-bank busy
+        bits for the flash the address lives in; TC4 waits for the command
+        interface to report REQDONE in HCI_STATUS."""
+        if self.p.wait != "reqdone":
+            self.wait_unbusy(_busy_mask(addr), timeout)
+            return
+        import time
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.dap.try_read_word(self.p.status)
+            if status is None:
+                raise DapError("HCI_STATUS unreadable during flash op")
+            if status & HCI_REQDONE:
+                return
+            if time.monotonic() > deadline:
+                raise DapError("flash cmd not done past %.1fs (HCI_STATUS=0x%08X)"
+                               % (timeout, status))
 
     def enter_page_mode(self, page_addr):
         page_addr = _prog_alias(page_addr)
@@ -112,7 +204,37 @@ class Flash:
         self._cmd(0xAA50, _prog_alias(sector_addr))
         self._cmd(0xAA58, count)
         self._cmd(0xAAA8, 0x80)
-        self._cmd(0xAAA8, 0x50)
+        self._cmd(0xAAA8, FSI_ERASE_CYCLE2)
+
+    def clear_errors(self):
+        """Clear the DMU error latches so a following verify reads clean."""
+        self.dap.write_word(self.p.clre, self.p.clre_clear_all)
+
+    def verify_erased_sectors(self, sector_addr, count):
+        """Blank-check [sector_addr, +count sectors) with the flash state machine
+        instead of reading the array. Non-destructive: issues Verify Erased
+        Logical Sector Range (0x80, 0x5F), NOT Erase. Returns True if the range
+        is fully blank (the error register's EVER stayed clear), False if any
+        cell is programmed. Raises DapError on a transport fault or a sequence/
+        protection error (which is not a blank/not-blank answer)."""
+        p = self.p
+        addr = _prog_alias(sector_addr)
+        if p.wait == "reqdone":
+            # TC4: reset the REQACK/REQDONE handshake before issuing the command.
+            self.clear_status()
+        self.clear_errors()
+        self._cmd(0xAA50, addr)
+        self._cmd(0xAA58, count)
+        self._cmd(0xAAA8, 0x80)
+        self._cmd(0xAAA8, FSI_VERIFY_ERASED_CYCLE2)
+        self._wait_cmd_done(addr)
+        errsr = self.dap.read_word(p.errsr)
+        if errsr & p.reject_mask:              # OPER / SQER / PROER
+            self.clear_errors()
+            raise DapError("verify-erased rejected (%s=0x%08X)" % (p.errsr_name, errsr))
+        blank = not (errsr & p.ever)
+        self.clear_errors()
+        return blank
 
     def program_page(self, page_addr, page_bytes, busy_mask):
         """Program one aligned page (32 B PFLASH / 8 B DFLASH), padded with 0xFF."""
@@ -132,6 +254,153 @@ def _read_region(dap, addr, length):
     end = (addr + length + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1)
     data = dap.read_blocks(list(range(start, end, Dap.BLOCK)))
     return data[addr - start: addr - start + length]
+
+
+def read_region_sparse(dap, addr, length, group=16, on_progress=None):
+    """Read [addr, addr+length) tolerating erased/unreadable blocks.
+
+    Erased flash traps with a no-response on 2G/TC4 parts, and after a miss the
+    target ignores reads until the connect handshake is re-sent, so every miss
+    reconnects. Blocks that answer are collected; blocks that do not are left
+    out. Returns (segments, missed_blocks) where segments is a list of
+    (block-aligned addr, bytes) runs of contiguous answered blocks, each cropped
+    to the requested [addr, addr+length) window.
+
+    on_progress(done_blocks, total_blocks, kept_bytes) is called as it goes.
+    """
+    block = Dap.BLOCK
+    start = addr & ~(block - 1)
+    end = (addr + length + block - 1) & ~(block - 1)
+    block_addrs = list(range(start, end, block))
+    total = len(block_addrs)
+
+    segments = []          # list of [addr, bytearray] contiguous runs
+    kept_bytes = 0
+    missed = 0
+
+    def keep(a, data):
+        nonlocal kept_bytes
+        kept_bytes += len(data)
+        if segments and segments[-1][0] + len(segments[-1][1]) == a:
+            segments[-1][1] += data
+        else:
+            segments.append([a, bytearray(data)])
+
+    i = 0
+    while i < total:
+        n = min(group, total - i)
+        addrs = block_addrs[i:i + n]
+        data = None
+        if n > 1:
+            try:
+                data = dap.read_blocks(addrs)
+            except DapError:
+                dap.connect()
+                data = None
+        if data is not None and len(data) == n * block:
+            for j, a in enumerate(addrs):
+                keep(a, data[j * block:(j + 1) * block])
+        else:
+            # the group hit a hole: fall back to one block at a time
+            for a in addrs:
+                try:
+                    one = dap.read_block(a)
+                except DapError:
+                    dap.connect()
+                    missed += 1
+                    continue
+                keep(a, one)
+        i += n
+        if on_progress:
+            on_progress(i, total, kept_bytes)
+
+    lo, hi = addr, addr + length
+    cropped = []
+    for seg_addr, seg_data in segments:
+        a0 = max(seg_addr, lo)
+        a1 = min(seg_addr + len(seg_data), hi)
+        if a1 > a0:
+            cropped.append((a0, bytes(seg_data[a0 - seg_addr:a1 - seg_addr])))
+    return cropped, missed
+
+
+def blank_map(dap, addr, length, sector=PFLASH_LOG_SECTOR, on_progress=None,
+              family="tc3xx"):
+    """Occupancy map of [addr, addr+length) by PFLASH logical sector, using the
+    flash controller's hardware blank-check (no array reads, no ECC traps).
+
+    Returns a list of (sector_addr, blank: bool), one entry per sector. Covers
+    TC3xx (2G DMU HF_*) and TC4 (TC4Dx HCI_*) via the family profile; the caller
+    must gate the family and keep the target unlocked/flash-booting. Issues only
+    Verify-Erased (non-destructive) sequences.
+    """
+    first = addr & ~(sector - 1)
+    last = (addr + length - 1) & ~(sector - 1)
+    sectors = list(range(first, last + 1, sector))
+    flash = Flash(dap, family)
+    flash.clear_status()
+    out = []
+    for i, sa in enumerate(sectors):
+        blank = flash.verify_erased_sectors(sa, 1)
+        out.append((sa, blank))
+        if on_progress:
+            on_progress(i + 1, len(sectors), sa, blank)
+    flash.reset_to_read()
+    return out
+
+
+def read_region_blankcheck(dap, addr, length, sector=PFLASH_LOG_SECTOR,
+                           on_map=None, on_read=None, family="tc3xx"):
+    """Sparse read of [addr, addr+length) guided by the hardware blank-check:
+    map occupancy by sector (no array reads), then block-read ONLY the
+    programmed sectors. The erased bulk is never touched, so this avoids the
+    per-erased-block reconnect that read_region_sparse pays. PFLASH only; covers
+    TC3xx and TC4 via the family profile.
+
+    Returns (segments, missed) like read_region_sparse. on_map(done, total) and
+    on_read(done_bytes, total_bytes) report the two phases.
+    """
+    occ = blank_map(dap, addr, length, sector=sector, family=family,
+                    on_progress=(lambda d, t, sa, bl: on_map(d, t)) if on_map else None)
+    programmed = [sa for sa, blank in occ if not blank]
+    # merge contiguous programmed sectors into ranges, each clamped to the window
+    ranges = []
+    for sa in programmed:
+        if ranges and ranges[-1][1] == sa:
+            ranges[-1][1] = sa + sector
+        else:
+            ranges.append([sa, sa + sector])
+    total = sum(b - a for a, b in ranges) or 1
+    segments, missed, done = [], 0, 0
+    for a, b in ranges:
+        lo = max(a, addr)
+        hi = min(b, addr + length)
+        if hi <= lo:
+            continue
+        segs, miss = read_region_sparse(dap, lo, hi - lo)
+        segments.extend(segs)
+        missed += miss
+        done += hi - lo
+        if on_read:
+            on_read(done, total)
+
+    # Per-sector fidelity check: a sector the blank-check called programmed but
+    # from which nothing read back (e.g. uncorrectable ECC) is reported, not
+    # faked. Done per sector so a readable neighbour cannot mask it.
+    def _has_data(lo, hi):
+        return any(sa < hi and sa + len(d) > lo for sa, d in segments)
+
+    unreadable = []
+    for sa, blank in occ:
+        if blank:
+            continue
+        lo, hi = max(sa, addr), min(sa + sector, addr + length)
+        if hi > lo and not _has_data(lo, hi):
+            if unreadable and unreadable[-1][1] == lo:
+                unreadable[-1] = (unreadable[-1][0], hi)
+            else:
+                unreadable.append((lo, hi))
+    return segments, missed, unreadable
 
 
 def _program(dap, image, args):

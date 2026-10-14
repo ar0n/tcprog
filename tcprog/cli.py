@@ -7,12 +7,16 @@ import json
 import os
 import sys
 
+import bincopy
+
 from . import __version__ as VERSION
 from .chips import all_chips, by_chipid, chipid_addrs, _resolve_chip
 from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
                   _locked, _unlock_failed_msg)
 from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _is_pflash,
-                    _pflash_sectors, _program, _read_ucbs, bmhd_blocks, read_words)
+                    _pflash_sectors, _program, _read_ucbs, blank_map, bmhd_blocks,
+                    read_region_blankcheck,
+                    read_region_sparse, read_words)
 from .image import load_image, _emit, _hexdump, _out_format
 from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
 
@@ -193,6 +197,10 @@ def _add_read_args(p):
     g.add_argument("-o", "--output", help="output file (bin/srec/hex by extension); omit to hexdump")
     g.add_argument("--format", choices=("srec", "hex", "bin"), default=None,
                    help="override the output format")
+    g.add_argument("--skip-erased", "--sparse", dest="skip_erased", action="store_true",
+                   help="tolerate erased/unreadable blocks: keep only what answers and "
+                        "emit a sparse image (srec/hex). Needed to read a whole device "
+                        "whose flash is mostly erased.")
     g.add_argument("--asc-bsl-compress", action="store_true", help="LZ4 the transfer (ASC BSL route)")
     g.add_argument("--no-progress", action="store_true", help="disable the progress line")
     return p
@@ -291,6 +299,19 @@ def _build_parser():
                     help="required to erase a whole region")
     ge.add_argument("--yes", action="store_true", help="do not prompt for confirmation")
     pe.set_defaults(func=_cmd_erase)
+
+    pbc = sub.add_parser("blankcheck", help="map programmed vs erased flash with the "
+                                            "controller's hardware blank-check",
+                         description="Report which PFLASH sectors are programmed, using the "
+                                     "flash controller's Verify-Erased command (no array "
+                                     "reads, no ECC traps). Non-destructive. TC3xx only.")
+    _add_conn_args(pbc)
+    gbc = pbc.add_argument_group("blankcheck")
+    gbc.add_argument("--addr", type=_hexint, help="start address (rounded down to a sector)")
+    gbc.add_argument("--length", type=_hexint, help="bytes to check (rounded up to sectors)")
+    gbc.add_argument("--region", choices=("pflash",), help="check a whole region")
+    gbc.add_argument("--no-progress", action="store_true", help="disable the progress line")
+    pbc.set_defaults(func=_cmd_blankcheck)
 
     pu = sub.add_parser("unlock", help="present the debug password / disable protection (not yet implemented)")
     _add_conn_args(pu)
@@ -583,29 +604,100 @@ def _cmd_read(args):
                                  "memory slice; reading erased flash raises an ECC error "
                                  "and can wedge the target.\n" % (addr, addr + length))
 
-        block_size = Dap.BLOCK
-        start = addr & ~(block_size - 1)
-        end = (addr + length + block_size - 1) & ~(block_size - 1)
-        block_addrs = list(range(start, end, block_size))
-        buffer, group_size = bytearray(), 16
-        started = time.time()
-        try:
-            for index in range(0, len(block_addrs), group_size):
-                buffer += dap.read_blocks(block_addrs[index:index + group_size])
+        if args.skip_erased:
+            if fmt == "bin":
+                return _error("--skip-erased needs a sparse container; use "
+                              "--format srec or hex (bin cannot hold the gaps)",
+                              os.EX_USAGE)
+            total_kib = (((addr + length + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1))
+                         - (addr & ~(Dap.BLOCK - 1))) // 1024
+
+            def progress(done, total, kept):
                 if not args.quiet and not args.no_progress:
-                    sys.stderr.write("\r  read %d/%d KiB"
-                                     % (len(buffer) // 1024, (end - start) // 1024))
+                    sys.stderr.write("\r  scan %d/%d KiB  kept %d KiB"
+                                     % (done, total, kept // 1024))
                     sys.stderr.flush()
-        except DapError as error:
+
+            # On TC3xx/TC4 PFLASH, map occupancy with the hardware blank-check and
+            # read only the programmed sectors - the erased bulk is never read,
+            # so there is no per-block reconnect over empty flash. Elsewhere
+            # (TC2xx, non-PFLASH) fall back to the plain block scan.
+            use_bc = (chip is not None and chip.family in ("tc3xx", "tc4xx")
+                      and _is_pflash(addr))
+            started = time.time()
+            try:
+                if use_bc:
+                    def on_map(done, total):
+                        if not args.quiet and not args.no_progress:
+                            sys.stderr.write("\r  blank-check %d/%d sectors" % (done, total))
+                            sys.stderr.flush()
+                    segments, missed, unreadable = read_region_blankcheck(
+                        dap, addr, length, on_map=on_map, family=chip.family)
+                else:
+                    segments, missed = read_region_sparse(
+                        dap, addr, length, on_progress=progress)
+                    unreadable = []
+            except DapError as error:
+                sys.stderr.write("\ntcprog: sparse read failed: %s\n" % error)
+                return os.EX_IOERR
             if not args.quiet and not args.no_progress:
                 sys.stderr.write("\n")
-            sys.stderr.write("tcprog: read failed near 0x%08X: %s\n"
-                             % (start + len(buffer), error))
-            return os.EX_IOERR
-        if not args.quiet and not args.no_progress:
-            sys.stderr.write("\n")
-        elapsed = time.time() - started
-        data = bytes(buffer[addr - start: addr - start + length])
+            elapsed = time.time() - started
+            data_len = sum(len(d) for _, d in segments)
+        else:
+            block_size = Dap.BLOCK
+            start = addr & ~(block_size - 1)
+            end = (addr + length + block_size - 1) & ~(block_size - 1)
+            block_addrs = list(range(start, end, block_size))
+            buffer, group_size = bytearray(), 16
+            started = time.time()
+            try:
+                for index in range(0, len(block_addrs), group_size):
+                    buffer += dap.read_blocks(block_addrs[index:index + group_size])
+                    if not args.quiet and not args.no_progress:
+                        sys.stderr.write("\r  read %d/%d KiB"
+                                         % (len(buffer) // 1024, (end - start) // 1024))
+                        sys.stderr.flush()
+            except DapError as error:
+                if not args.quiet and not args.no_progress:
+                    sys.stderr.write("\n")
+                sys.stderr.write("tcprog: read failed near 0x%08X: %s\n"
+                                 % (start + len(buffer), error))
+                return os.EX_IOERR
+            if not args.quiet and not args.no_progress:
+                sys.stderr.write("\n")
+            elapsed = time.time() - started
+            data = bytes(buffer[addr - start: addr - start + length])
+
+    if args.skip_erased:
+        binfile = bincopy.BinFile()
+        for seg_addr, seg_data in segments:
+            binfile.add_binary(seg_data, address=seg_addr)
+        payload = (binfile.as_ihex() if fmt == "hex" else binfile.as_srec())
+        if args.output:
+            try:
+                with open(args.output, "w") as handle:
+                    handle.write(payload)
+            except OSError as error:
+                return _error(error, os.EX_CANTCREAT)
+        else:
+            for seg_addr, seg_data in segments:
+                _hexdump(seg_data, seg_addr)
+        throughput = (data_len / 1024.0) / elapsed if elapsed > 0 else 0.0
+        if not args.quiet:
+            for seg_addr, seg_data in segments:
+                sys.stderr.write("  segment 0x%08X .. 0x%08X (%d KiB)\n"
+                                 % (seg_addr, seg_addr + len(seg_data), len(seg_data) // 1024))
+            sys.stderr.write("tcprog: sparse read of [0x%08X,0x%08X): %d KiB kept in "
+                             "%d segment(s), %d block(s) erased (%.1f KiB/s)%s\n"
+                             % (addr, addr + length, data_len // 1024, len(segments),
+                                missed, throughput,
+                                " -> " + args.output if args.output else ""))
+            for lo, hi in unreadable:
+                sys.stderr.write("tcprog: warning - 0x%08X..0x%08X blank-checks as "
+                                 "programmed but did not read back (uncorrectable ECC?); "
+                                 "omitted from the image\n" % (lo, hi))
+        return os.EX_OK
 
     try:
         payload = _emit(data, addr, fmt)
@@ -769,6 +861,102 @@ def _cmd_erase(args):
             return _error("erase failed: %s" % error, os.EX_IOERR)
     if not args.quiet:
         log("tcprog: erased %d sector(s) (0x%08X..0x%08X)" % (count, first, end))
+    return os.EX_OK
+
+
+def _cmd_blankcheck(args):
+    if args.transport != "dap":
+        return _todo("blankcheck over %s" % args.transport)
+    chip, error = _resolve_chip(args)
+    if error:
+        return _error(error, os.EX_USAGE)
+    if chip is None:
+        return _error("blankcheck requires the target: pass -c/--chip or --device",
+                      os.EX_USAGE)
+    # Covered: TC3xx (2G DMU HF_*) and TC4 (TC4Dx HCI_*). TC2xx has a different
+    # FLASH0 FSR layout and is not handled, so refuse rather than drive its flash.
+    if chip.family not in ("tc3xx", "tc4xx"):
+        return _error("blankcheck covers TC3xx and TC4 (the verify-error decode and "
+                      "FSI register map are DMU-specific; %s is %s)"
+                      % (chip.name, chip.family), os.EX_UNAVAILABLE)
+
+    addr, length = args.addr, args.length
+    if args.region:
+        seg = chip.first(args.region)
+        if seg is None:
+            return _error("%s has no %s region" % (chip.name, args.region), os.EX_USAGE)
+        addr = seg.base if addr is None else addr
+        length = seg.size if length is None else length
+    if addr is None or length is None:
+        return _error("blankcheck needs --addr and --length, or --region pflash", os.EX_USAGE)
+    if not _is_pflash(addr):
+        return _error("blankcheck supports PFLASH only", os.EX_USAGE)
+
+    try:
+        dap = _open_dap(args)
+    except Fail as f:
+        return _error(f, f.code)
+    with dap:
+        try:
+            id_addr, chipid = _unlock_if_locked(dap, args, chip)
+        except Fail as f:
+            return _error(f, f.code)
+        # Cross-check the silicon before driving its flash: the FSI sequence must
+        # never land on a part that only matched because -c said so. The detected
+        # family also picks the register profile, so it must agree with -c.
+        detected = by_chipid(chipid, id_addr)
+        if detected is not None and detected.family not in ("tc3xx", "tc4xx"):
+            return _error("refusing to blank-check: connected target is %s (%s), not a "
+                          "TC3xx/TC4 part" % (detected.name, detected.family), EX_REFUSED)
+        if detected is not None and detected.family != chip.family:
+            return _error("refusing to blank-check: connected target is %s (%s) but -c "
+                          "says %s (%s); the FSI register map differs per family"
+                          % (detected.name, detected.family, chip.name, chip.family),
+                          EX_REFUSED)
+        if detected is None:
+            return _error("refusing to blank-check: cannot confirm the connected part "
+                          "(chipid 0x%08X unrecognised)" % (chipid or 0), EX_REFUSED)
+
+        def progress(done, total, sa, blank):
+            if not args.quiet and not args.no_progress:
+                sys.stderr.write("\r  blank-check %d/%d sectors" % (done, total))
+                sys.stderr.flush()
+
+        try:
+            sectors = blank_map(dap, addr, length, on_progress=progress,
+                                family=chip.family)
+        except DapError as error:
+            if not args.quiet and not args.no_progress:
+                sys.stderr.write("\n")
+            return _error("blankcheck failed: %s" % error, os.EX_IOERR)
+        if not args.quiet and not args.no_progress:
+            sys.stderr.write("\n")
+
+    # merge contiguous programmed sectors into ranges
+    prog = [sa for sa, blank in sectors if not blank]
+    ranges, step = [], PFLASH_LOG_SECTOR
+    for sa in prog:
+        if ranges and ranges[-1][1] == sa:
+            ranges[-1][1] = sa + step
+        else:
+            ranges.append([sa, sa + step])
+    prog_bytes = len(prog) * step
+
+    if args.json:
+        print(json.dumps({"chip": chip.name, "addr": "0x%08X" % addr, "length": length,
+                          "sector": step, "sectors": len(sectors),
+                          "programmed_sectors": len(prog),
+                          "programmed": [{"addr": "0x%08X" % a, "end": "0x%08X" % b}
+                                         for a, b in ranges]}))
+    else:
+        for a, b in ranges:
+            print("  programmed  0x%08X .. 0x%08X  (%d KiB)" % (a, b, (b - a) // 1024))
+        if not ranges:
+            print("  (all %d sectors blank)" % len(sectors))
+        if not args.quiet:
+            sys.stderr.write("tcprog: %d/%d sectors programmed (%d KiB) in [0x%08X,0x%08X)\n"
+                             % (len(prog), len(sectors), prog_bytes // 1024,
+                                addr, addr + length))
     return os.EX_OK
 
 
