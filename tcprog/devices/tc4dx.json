@@ -2,11 +2,12 @@
     "name": "tc4dx",
     "family": "tc4xx",
     "aliases": [
-        "tc4d"
+        "tc4d",
+        "tc4d7"
     ],
-    "chipid_addr": null,
-    "chipid": null,
-    "chipid_mask": "0xFFFFF000",
+    "chipid_addr": "0xFA180080",
+    "chipid": "0x10225083",
+    "chipid_mask": "0x0FFFFFFF",
     "memory": [
         {
             "name": "pflash",
@@ -41,5 +42,5 @@
     "procondf": null,
     "procondbg": null,
     "hf_protect": null,
-    "_notes": "Harvested from iLLD tc4xx (IfxFlash_cfg_TC4Dx.h). 3G (TC4Dx): registers + flash sizes only; UCB/CFS/scratchpad map and BSL payload NOT developed - verify from the TC4xx UM."
+    "_notes": "Harvested from iLLD tc4xx (IfxFlash_cfg_TC4Dx.h). 3G (TC4Dx): registers + flash sizes only; UCB/CFS/scratchpad map and BSL payload NOT developed - verify from the TC4xx UM. Identity is CBS_JTAGID (0xFA180080; TC4xx has no SCU_CHIPID), measured 0x10225083 on a TC4D7 lite kit; mask drops the version nibble (step). Other TC4Dx parts may use another JTAG part number - unverified."
 }

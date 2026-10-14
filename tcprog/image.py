@@ -126,10 +126,12 @@ HWCFG_FLASH, HWCFG_ABM, HWCFG_GEN_BSL, HWCFG_ASC_BSL = 0x7, 0x6, 0x4, 0x3
 VALID_HWCFG = {HWCFG_FLASH, HWCFG_ABM, HWCFG_GEN_BSL, HWCFG_ASC_BSL}
 
 
-def crc32_bmhd(header8):
-    if len(header8) < 8:
-        raise ValueError("need 8 header bytes")
-    swapped = b"".join(bytes(header8[i:i + 4][::-1]) for i in range(0, 8, 4))
+def crc32_bmhd(header):
+    """CRC over whole 32-bit words, each byte-swapped (fed big-endian): 8 bytes on
+    TC2xx/TC3xx, 12 on TC4xx."""
+    if len(header) < 8 or len(header) % 4:
+        raise ValueError("need 8 or more header bytes, whole words")
+    swapped = b"".join(bytes(header[i:i + 4][::-1]) for i in range(0, len(header), 4))
     return zlib.crc32(swapped) & 0xFFFFFFFF
 
 
@@ -165,6 +167,39 @@ def validate_bmhd(data, chip=None):
         problems.append("CRCBMHD 0x%08X != 0x%08X" % (header["crcbmhd"], expected))
     if header["crcbmhd_n"] != (~expected & 0xFFFFFFFF):
         problems.append("CRCBMHD_N invalid")
+    return (not problems), problems
+
+
+# TC4xx BMHD: SAL (the header's own address) | BMI | BMHDID | STAD | CRC, no
+# inverted CRC; the CRC also covers SAL. From iLLD Ifx_Ssw.h (TC4Dx), verified
+# against its four sample headers and a TC4D7 lite kit. The BMI bit meanings are
+# not in the iLLD, so the BMI is reported raw.
+def parse_bmhd_tc4(data):
+    if len(data) < 16:
+        raise ValueError("TC4xx BMHD is 16 bytes")
+    return {"sal": int.from_bytes(data[0:4], "little"),
+            "bmi": int.from_bytes(data[4:6], "little"),
+            "bmhdid": int.from_bytes(data[6:8], "little"),
+            "stad": int.from_bytes(data[8:12], "little"),
+            "crcbmhd": int.from_bytes(data[12:16], "little")}
+
+
+def validate_bmhd_tc4(data, addr, chip=None):
+    if len(data) < 16:
+        return False, ["shorter than 16 bytes"]
+    header = parse_bmhd_tc4(data)
+    problems = []
+    if header["bmhdid"] != BMHDID:
+        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
+    if header["sal"] != addr:
+        problems.append("SAL 0x%08X != header address 0x%08X" % (header["sal"], addr))
+    if header["stad"] & 0x3:
+        problems.append("STAD 0x%08X not word-aligned" % header["stad"])
+    if chip is not None and not any(sl.contains(header["stad"]) for sl in chip.slices("pflash")):
+        problems.append("STAD 0x%08X not in program flash" % header["stad"])
+    expected = crc32_bmhd(data[0:12])
+    if header["crcbmhd"] != expected:
+        problems.append("CRCBMHD 0x%08X != 0x%08X" % (header["crcbmhd"], expected))
     return (not problems), problems
 
 

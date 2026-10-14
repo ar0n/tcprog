@@ -102,11 +102,21 @@ def lookup_chip(name):
     return None
 
 
-def by_chipid(value):
+def by_chipid(value, addr=None):
+    """The chip whose ID register (at `addr`, when given) reads `value`."""
     for chip in _CHIPS.values():
-        if chip.matches_chipid(value):
+        if (addr is None or chip.chipid_addr == addr) and chip.matches_chipid(value):
             return chip
     return None
+
+
+def chipid_addrs():
+    """Distinct identity-register addresses in the DB, older families first."""
+    out = []
+    for chip in all_chips():
+        if chip.chipid_addr is not None and chip.chipid_addr not in out:
+            out.append(chip.chipid_addr)
+    return out
 
 
 def load_device_file(path):

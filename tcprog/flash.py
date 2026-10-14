@@ -11,7 +11,7 @@ import os
 import sys
 
 from .dap import Dap, DapError
-from .image import parse_bmhd, validate_bmhd
+from .image import parse_bmhd, parse_bmhd_tc4, validate_bmhd, validate_bmhd_tc4
 from .util import EX_VERIFY, Fail, _error, log
 
 FSI_BASE = 0xAF000000
@@ -26,6 +26,11 @@ PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (192 x 2 over 6 MB)
 UCB_CONFIRM_OFF = 0x1F0
 UCB_BLOCKS = (("bmhd0", 0x00), ("pflash", 0x10), ("dflash", 0x11), ("dbg", 0x12))
 _CONFIRM = {0x43211234: "UNCONFIRMED", 0x57B5327F: "CONFIRMED", 0x00000000: "ERASED"}
+
+# TC4xx: four 2 KiB BMHD blocks (iLLD Lcf .bmhd_N_org, Ifx_Ssw_Bmhd), each with
+# the 8-word password at +0x7D0 and the confirmation word (+ a copy) at +0x7F0/8.
+TC4_BMHD_BASE, TC4_BMHD_STRIDE, TC4_BMHD_COUNT = 0xAE404800, 0x800, 4
+TC4_CONFIRM_OFF, TC4_CONFIRM_COPY_OFF = 0x7F0, 0x7F8
 
 
 def _ucb_stride(family):
@@ -178,9 +183,51 @@ def _program(dap, image, args):
     return os.EX_OK
 
 
+def bmhd_blocks(chip):
+    """The BMHD blocks tcprog knows for this chip. -> [(name, addr, size)]."""
+    if chip.family == "tc4xx":
+        return [("bmhd%d" % n, TC4_BMHD_BASE + n * TC4_BMHD_STRIDE, TC4_BMHD_STRIDE)
+                for n in range(TC4_BMHD_COUNT)]
+    ucb = chip.first("ucb")
+    if ucb is None:
+        raise Fail("no UCB region known for this target; pass -c/--chip or --device",
+                   os.EX_USAGE)
+    return [("bmhd0", ucb.base, _ucb_stride(chip.family))]
+
+
+def read_words(dap, addr, size):
+    """Read [addr, addr+size) one word at a time, reconnecting on a miss. -> bytes."""
+    out = bytearray()
+    for off in range(0, size, 4):
+        value = dap.read_word_retry(addr + off)
+        if value is None:
+            raise Fail("no response reading 0x%08X" % (addr + off), os.EX_IOERR)
+        out += value.to_bytes(4, "little")
+    return bytes(out)
+
+
+def _read_bmhds_tc4(dap, chip):
+    out = []
+    for name, block, _size in bmhd_blocks(chip):
+        confirm = dap.read_word_retry(block + TC4_CONFIRM_OFF)
+        copy = dap.read_word_retry(block + TC4_CONFIRM_COPY_OFF)
+        state = "unreadable" if confirm is None \
+            else _CONFIRM.get(confirm, "0x%08X (unknown)" % confirm)
+        if confirm != copy:
+            state += " (copy %s)" % ("unreadable" if copy is None else "0x%08X" % copy)
+        header = read_words(dap, block, 16)
+        ok, problems = validate_bmhd_tc4(header, block, chip)
+        out.append({"name": name, "addr": block, "confirm": confirm, "state": state,
+                    "bmhd": parse_bmhd_tc4(header), "bmhd_ok": ok, "bmhd_problems": problems})
+    return out
+
+
 def _read_ucbs(dap, chip):
     """Read every known UCB's confirmation word (+ BMHD0 header). -> list of
-    dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}."""
+    dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}. On TC4xx
+    only the BMHD blocks are known."""
+    if chip is not None and chip.family == "tc4xx":
+        return _read_bmhds_tc4(dap, chip)
     ucb = chip.first("ucb") if chip else None
     if ucb is None:
         raise Fail("no UCB region known for this target; pass -c/--chip or --device",

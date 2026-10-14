@@ -12,7 +12,8 @@ _ADBUS_VAL, _ADBUS_DIR, _ACBUS_DIR = 0x80, 0xDB, 0xF7
 _ACBUS_IDLE, _ACBUS_TX, _ACBUS_RX = 0x55, 0x67, 0x57
 CMD_WRITEREG, CMD_WRITEMEM, CMD_READMEM, CMD_DAPISC, CMD_READREG, CMD_SET_IO_CLIENT = 8, 9, 10, 17, 26, 28
 REG_READ32 = 0x5
-SCU_CHIPID = 0xF0036140          # target identity register
+SCU_CHIPID = 0xF0036140          # target identity register (TC2xx/TC3xx)
+CBS_JTAGID_TC4 = 0xFA180080      # TC4xx has no SCU_CHIPID; identity is the JTAG ID
 # Block read: the READMEM low byte is (size & 0x3FC) | 1, so a 1024-byte read is
 # 0x400 & 0x3FC = 0 | 1 = 1 (the "IOADDR" selector); its reply is 1228 bytes.
 _REG_BLOCK, _RESP_BLOCK = 0x1, 1228
@@ -229,6 +230,17 @@ class Dap:
             return self.read_word(addr)
         except DapError:
             return None
+
+    def read_word_retry(self, addr, tries=2):
+        """try_read_word, re-sending the connect handshake before each retry: on a
+        TC4D7 a failed read leaves later reads unanswered until it is re-sent."""
+        for attempt in range(tries):
+            if attempt:
+                self.connect()
+            value = self.try_read_word(addr)
+            if value is not None:
+                return value
+        return None
 
     def write_word(self, addr, value):
         """Write one 32-bit word (WRITEMEM). Returns the two telegram replies."""

@@ -48,11 +48,14 @@ Each part is a JSON file in `tcprog/devices/` - the memory map as an explicit **
 slices** (the AURIX map has gaps: PFLASH, hole, DFLASH0, hole, UCB, hole, CFS,
 DF1/HSM), plus protection registers and the ASCLIN/WDT SFRs the ASC-BSL payload
 needs. `--chip` selects one (by name or a part-number alias, e.g. `tc397`,
-`tc275`); `ident` can detect it from `SCU_CHIPID`. The whole DB is regenerated
+`tc275`); `ident` can detect it from `SCU_CHIPID` (TC2xx/TC3xx) or `CBS_JTAGID`
+(TC4xx). The whole DB is regenerated
 from Infineon iLLD by `tools/harvest_illd.py --illd-root <path>/resources`.
 
 Coverage (production parts): TC2xx `tc22x/tc23x/tc26x/tc27x/tc29x`; TC3xx
-`tc33x/tc35x/tc36x/tc37x(=tc375)/tc38x/tc39x`; TC4xx `tc4dx` (regs+flash only).
+`tc33x/tc35x/tc36x/tc37x(=tc375)/tc38x/tc39x`; TC4xx `tc4dx` (identity + memory map only:
+`ident`, `read` and `ucb` (BMHD blocks); `write`/`erase` and debug unlock refuse
+it).
 TC2xx (1G) differs from 2G in the watchdog SFRs, the flash-protection module
 (FLASH0 vs the DMU), and the UCB layout - captured per-part in the JSON.
 
@@ -89,11 +92,20 @@ stochastic, so it retries `--unlock-tries` times, default 10).
 
 - `ident` resolves the part from `SCU_CHIPID` and reports the identity decoded
   from it: chip name (matched in the device DB), step, HSM flag, and PFLASH/DFLASH
-  sizes. It reports identity only, not protection state.
-- `ucb [decode|verify]` reads and decodes the User Configuration Blocks:
+  sizes. It reports identity only, not protection state. TC4xx has no
+  `SCU_CHIPID`; there it reads `CBS_JTAGID` (`0xFA180080`) and reports the JTAG
+  part number and version instead of the HSM flag (verified on a TC4D7 lite kit,
+  `0x10225083`).
+- `ucb [decode|verify|export]` reads and decodes the User Configuration Blocks:
   each UCB's confirmation state (CONFIRMED / UNCONFIRMED / ERASED) and the BMHD
   (boot mode header) contents + CRC. `verify` exits 81 (`EX_VERIFY`) if a UCB
-  confirmation word is unrecognized or a BMHD CRC is bad.
+  confirmation word is unrecognized or a BMHD CRC is bad. `export -o FILE` dumps
+  the raw BMHD blocks (header, password, confirmation) as bin/srec/hex.
+  On TC4xx only the four BMHD blocks are known (`0xAE404800 + n*0x800`, 2 KiB
+  each). Their header differs from TC3xx: `SAL` (the header's own address),
+  BMI, BMHDID, STAD and a CRC-32 over those 12 bytes, with no inverted CRC;
+  password at +0x7D0, confirmation word and its copy at +0x7F0/+0x7F8. The BMI
+  is shown raw, as its TC4xx bit layout is not in the iLLD.
 - `read` dumps `--addr`/`--length` (or a whole `--region` on a known `-c/--chip`)
   to `-o` as bin/srec/hex (by extension, or `--format`), or hexdumps to stdout.
   Reads are 1 KiB blocks batched over one USB transfer; output verified

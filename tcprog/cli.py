@@ -8,11 +8,11 @@ import os
 import sys
 
 from . import __version__ as VERSION
-from .chips import all_chips, by_chipid, _resolve_chip
+from .chips import all_chips, by_chipid, chipid_addrs, _resolve_chip
 from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
                   _locked, _unlock_failed_msg)
 from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _is_pflash,
-                    _pflash_sectors, _program, _read_ucbs)
+                    _pflash_sectors, _program, _read_ucbs, bmhd_blocks, read_words)
 from .image import load_image, _emit, _hexdump, _out_format
 from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
 
@@ -62,6 +62,20 @@ def _decode_chipid(v):
     return {"sec": (v >> 31) & 1, "vart": (v >> 28) & 7, "fsize": (v >> 24) & 0xF,
             "ucode": (v >> 17) & 0x7F, "chid": (v >> 12) & 0xF,
             "chpk": (v >> 8) & 0xF, "chtec": (v >> 6) & 3, "chrev": v & 0x3F}
+
+
+def _decode_jtagid(v):
+    """IEEE 1149.1 ID: version, part number, manufacturer (Infineon = 0x083)."""
+    return {"version": (v >> 28) & 0xF, "part": (v >> 12) & 0xFFFF, "manuf": (v >> 1) & 0x7FF}
+
+
+def _refuse_tc4(chip, what):
+    """TC4xx: identity, reads and BMHD decode only. Its flash/unlock paths are not
+    ported, and the TC2xx/TC3xx sequences must not run against it. -> exit code or None."""
+    if chip is not None and chip.family == "tc4xx":
+        return _error("%s is not supported on %s yet (TC4xx: ident, read, ucb only)"
+                      % (what, chip.name), os.EX_UNAVAILABLE)
+    return None
 
 
 def _todo(cmd):
@@ -246,8 +260,14 @@ def _build_parser():
 
     pucb = sub.add_parser("ucb", help="read and decode the User Configuration Blocks",
                           description="Read and decode the UCBs (confirmation state + BMHD).")
-    pucb.add_argument("action", nargs="?", choices=("decode", "verify"), default="decode",
-                      help="decode (default) or verify UCB integrity")
+    pucb.add_argument("action", nargs="?", choices=("decode", "verify", "export"),
+                      default="decode",
+                      help="decode (default), verify UCB integrity, or export the raw "
+                           "BMHD blocks to -o")
+    pucb.add_argument("-o", "--output", metavar="FILE",
+                      help="export: output file; bin/srec/hex by extension or --format")
+    pucb.add_argument("--format", choices=("bin", "srec", "hex"),
+                      help="export: output format (default: from the -o extension)")
     _add_conn_args(pucb)
     pucb.set_defaults(func=_cmd_ucb)
 
@@ -298,12 +318,29 @@ def _open_dap(args):
     return dap
 
 
-def _unlock_if_locked(dap, args):
-    """Read SCU_CHIPID; if the part is debug-locked, unlock with --debug-unlock-pw.
-    -> chipid. Raises Fail (locked=True when no password was given)."""
-    chipid = dap.try_read_word(SCU_CHIPID)
+def _read_identity(dap, chip=None):
+    """Read the identity register: the known chip's, else each one in the DB in
+    turn (SCU_CHIPID on TC2xx/TC3xx, CBS_JTAGID on TC4xx). -> (addr, value),
+    value None if none answered."""
+    addrs = [chip.chipid_addr] if chip is not None and chip.chipid_addr else chipid_addrs()
+    for addr in addrs:
+        value = dap.read_word_retry(addr)
+        if not _locked(value):
+            return addr, value
+    return SCU_CHIPID, None
+
+
+def _unlock_if_locked(dap, args, chip=None):
+    """Read the identity register; if the part is debug-locked, unlock with
+    --debug-unlock-pw. -> (id_addr, id_value). Raises Fail (locked=True when no
+    password was given)."""
+    addr, chipid = _read_identity(dap, chip)
     if not _locked(chipid):
-        return chipid
+        return addr, chipid
+    if chip is not None and chip.family == "tc4xx":
+        raise Fail("locked; TC4xx debug unlock is not supported (its authentication "
+                   "differs from the TC2xx/TC3xx key exchange)", os.EX_NOPERM,
+                   locked=not args.debug_unlock_pw)
     if not args.debug_unlock_pw:
         raise Fail("locked (DBGIFLCK); pass --debug-unlock-pw to unlock",
                    os.EX_NOPERM, locked=True)
@@ -318,7 +355,7 @@ def _unlock_if_locked(dap, args):
     if not ok:
         raise Fail(_unlock_failed_msg(dap, tries), os.EX_NOPERM)
     log("tcprog: unlocked after %d attempt%s" % (tries, "" if tries == 1 else "s"), verbose=True)
-    return chipid
+    return SCU_CHIPID, chipid
 
 
 # ======================================================================
@@ -341,7 +378,7 @@ def _cmd_ident(args):
 
     with dap:
         try:
-            chipid = _unlock_if_locked(dap, args)
+            id_addr, chipid = _unlock_if_locked(dap, args, chip)
         except Fail as f:
             if f.locked:
                 # Link is up but identity is unreadable: present and debug-locked.
@@ -356,8 +393,11 @@ def _cmd_ident(args):
             return _error(f, f.code)
 
         if chip is None:
-            chip = by_chipid(chipid)
-        fields = _decode_chipid(chipid)
+            chip = by_chipid(chipid, id_addr)
+        jtag = id_addr != SCU_CHIPID
+        fields = _decode_jtagid(chipid) if jtag else _decode_chipid(chipid)
+        step = fields["version"] if jtag else fields["chrev"]
+        hsm = None if jtag else bool(fields["sec"])
         pf_kib = (chip.first("pflash").size // 1024) if chip and chip.first("pflash") else None
         df_kib = (chip.first("dflash").size // 1024) if chip and chip.first("dflash") else None
 
@@ -370,11 +410,12 @@ def _cmd_ident(args):
                     "name": chip.name if chip else None,
                     "partNumber": part,
                     "family": chip.family if chip else None,
-                    "step": "0x%02X" % fields["chrev"],
+                    "idRegister": "JTAGID" if jtag else "CHIPID",
+                    "step": "0x%02X" % step,
                 },
                 "pflashKiB": pf_kib,
                 "dflashKiB": df_kib,
-                "hsm": bool(fields["sec"]),
+                "hsm": hsm,
             }))
         else:
             wanted = args.fields.split(",") if args.fields else None
@@ -382,13 +423,16 @@ def _cmd_ident(args):
             def show(key, label, value):
                 if wanted is None or key in wanted:
                     print("    %-8s %s" % (label, value))
-            print("target (%s), chipid: 0x%08X" % (probe_label, chipid))
+            kind = "jtagid" if jtag else "chipid"
+            print("target (%s), %s: 0x%08X" % (probe_label, kind, chipid))
             if wanted is None:
-                print("  identity (decoded from the chipid):")
+                print("  identity (decoded from the %s):" % kind)
             show("chip", "chip", "%s (%s)" % (chip.name if chip else "unknown",
                                               chip.family if chip else "?"))
-            show("step", "step", "0x%02X" % fields["chrev"])
-            show("hsm", "hsm", "%s" % bool(fields["sec"]))
+            if jtag:
+                show("part", "part", "0x%04X" % fields["part"])
+            show("step", "step", "0x%02X" % step)
+            show("hsm", "hsm", "?" if hsm is None else "%s" % hsm)
             show("pflash", "pflash", "%s KiB" % pf_kib if pf_kib else "?")
             show("dflash", "dflash", "%s KiB" % df_kib if df_kib else "?")
 
@@ -405,6 +449,32 @@ def _cmd_ident(args):
 # ======================================================================
 # ucb
 # ======================================================================
+def _export_bmhds(dap, chip, args):
+    """Read the raw BMHD blocks (header, password, confirmation) to -o."""
+    if not args.output:
+        raise Fail("ucb export needs -o FILE", os.EX_USAGE)
+    fmt = args.format or _out_format(args.output)
+    blocks = bmhd_blocks(chip)
+    for (_n, addr, size), (_m, nxt, _s) in zip(blocks, blocks[1:]):
+        if addr + size != nxt:
+            raise Fail("BMHD blocks are not contiguous; export does not handle gaps",
+                       os.EX_SOFTWARE)
+    data = b""
+    for name, addr, size in blocks:
+        log("tcprog: reading %s @ 0x%08X (%d bytes)" % (name, addr, size), verbose=True)
+        data += read_words(dap, addr, size)
+    try:
+        with open(args.output, "wb") as handle:
+            handle.write(_emit(data, blocks[0][1], fmt))
+    except OSError as error:
+        raise Fail(error, os.EX_CANTCREAT)
+    if not args.quiet:
+        log("tcprog: exported %d BMHD block(s), 0x%08X..0x%08X (%d bytes, %s) -> %s"
+            % (len(blocks), blocks[0][1], blocks[0][1] + len(data), len(data), fmt,
+               args.output))
+    return os.EX_OK
+
+
 def _cmd_ucb(args):
     if args.transport != "dap":
         return _todo("ucb over %s" % args.transport)
@@ -418,9 +488,13 @@ def _cmd_ucb(args):
         return _error(f, f.code)
     with dap:
         try:
-            chipid = _unlock_if_locked(dap, args)
+            id_addr, chipid = _unlock_if_locked(dap, args, chip)
             if chip is None:
-                chip = by_chipid(chipid)
+                chip = by_chipid(chipid, id_addr)
+            if chip is None:
+                raise Fail("unknown target; pass -c/--chip or --device", os.EX_USAGE)
+            if action == "export":
+                return _export_bmhds(dap, chip, args)
             ucbs = _read_ucbs(dap, chip)
         except Fail as f:
             return _error(f, f.code)
@@ -429,7 +503,9 @@ def _cmd_ucb(args):
             print(json.dumps([{"name": u["name"], "addr": "0x%08X" % u["addr"],
                                "state": u["state"],
                                "bmhd": None if u["bmhd"] is None else
-                               {"hwcfg": u["bmhd"]["hwcfg"], "stad": "0x%08X" % u["bmhd"]["stad"],
+                               {"bmi": "0x%04X" % u["bmhd"]["bmi"],
+                                "hwcfg": u["bmhd"].get("hwcfg"),
+                                "stad": "0x%08X" % u["bmhd"]["stad"],
                                 "valid": u["bmhd_ok"]}} for u in ucbs]))
         elif action == "decode":
             print("UCBs (%s):" % chip.name)
@@ -437,8 +513,11 @@ def _cmd_ucb(args):
                 print("  %-7s @ 0x%08X  %s" % (u["name"], u["addr"], u["state"]))
                 if u["bmhd"] is not None:
                     b = u["bmhd"]
-                    print("          BMHD hwcfg=0x%X stad=0x%08X crc=%s"
-                          % (b["hwcfg"], b["stad"], "ok" if u["bmhd_ok"] else "BAD"))
+                    mode = ("hwcfg=0x%X" % b["hwcfg"]) if "hwcfg" in b else ("bmi=0x%04X" % b["bmi"])
+                    print("          BMHD %s stad=0x%08X crc=%s"
+                          % (mode, b["stad"], "ok" if u["bmhd_ok"] else "BAD"))
+                    for problem in u["bmhd_problems"]:
+                        print("          ! %s" % problem)
 
         if action == "verify":
             problems = []
@@ -492,12 +571,12 @@ def _cmd_read(args):
 
     with dap:
         try:
-            chipid = _unlock_if_locked(dap, args)
+            id_addr, chipid = _unlock_if_locked(dap, args, chip)
         except Fail as f:
             return _error(f, f.code)
 
         if chip is None:
-            chip = by_chipid(chipid)
+            chip = by_chipid(chipid, id_addr)
         if chip is not None and not args.quiet:
             if not (chip.slice_of(addr) and chip.slice_of(addr + length - 1)):
                 sys.stderr.write("tcprog: warning - [0x%08X,0x%08X) is outside a known "
@@ -581,6 +660,9 @@ def _cmd_write(args):
 
     if args.dry_run:
         return _dry_run_plan(image, args, chip)
+    refused = _refuse_tc4(chip, "write")
+    if refused is not None:
+        return refused
 
     # ALLOWLIST: every segment must sit inside one of the device's memory slices.
     # A custom --device file with only the permitted slices thus confines a write
@@ -621,7 +703,7 @@ def _cmd_write(args):
         return _error(f, f.code)
     with dap:
         try:
-            _unlock_if_locked(dap, args)
+            _unlock_if_locked(dap, args, chip)
         except Fail as f:
             return _error(f, f.code)
         try:
@@ -638,6 +720,9 @@ def _cmd_erase(args):
         return _error(error, os.EX_USAGE)
     if chip is None:
         return _error("erase requires the target: pass -c/--chip or --device", os.EX_USAGE)
+    refused = _refuse_tc4(chip, "erase")
+    if refused is not None:
+        return refused
 
     addr, length, whole = args.addr, args.length, False
     if args.region:
@@ -670,7 +755,7 @@ def _cmd_erase(args):
         return _error(f, f.code)
     with dap:
         try:
-            _unlock_if_locked(dap, args)
+            _unlock_if_locked(dap, args, chip)
         except Fail as f:
             return _error(f, f.code)
         try:
