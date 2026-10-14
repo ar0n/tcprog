@@ -40,7 +40,8 @@ class FlashProfile:
     HCI_STATUS, the sequence the TC4 iLLD itself uses after a command.
     """
     def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
-                 reject_mask, clre, clre_clear_all, status, wait):
+                 reject_mask, clre, clre_clear_all, status, wait,
+                 load_lo, load_hi):
         self.cmd_base = cmd_base
         self.errsr = errsr
         self.errsr_name = errsr_name
@@ -51,6 +52,10 @@ class FlashProfile:
         self.clre_clear_all = clre_clear_all
         self.status = status
         self.wait = wait
+        # Load-page offsets for a 32-bit master (iLLD IfxFlash_loadPage2X32):
+        # TC3xx takes lo at 0x55F0 then hi at 0x55F4; TC4 streams both to 0x55F4.
+        self.load_lo = load_lo
+        self.load_hi = load_hi
 
 
 # TC3xx 2G DMU (Infra/Sfr IfxDmu_regdef.h): HF_* registers. EVER bit4, PVER
@@ -60,7 +65,7 @@ PROFILE_TC3XX = FlashProfile(
     errsr=0xF8040034, errsr_name="HF_ERRSR", ever_bit=4, pver_bit=3,
     reject_mask=(1 << 0) | (1 << 1) | (1 << 2),
     clre=0xF8040038, clre_clear_all=(1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
-    status=0xF8040010, wait="busy")
+    status=0xF8040010, wait="busy", load_lo=0x55F0, load_hi=0x55F4)
 
 # TC4Dx DMU (Infra/Sfr/TC4Dx IfxDmu_reg.h + IfxDmu_bf.h): HCI_* registers.
 # Command base 0xF8080000 (IfxFlash_cfg_TC4Dx.h IFXFLASH_CMD_BASE_ADDRESS).
@@ -73,7 +78,7 @@ PROFILE_TC4XX = FlashProfile(
     reject_mask=(1 << 16) | (1 << 1) | (1 << 2),
     clre=0xF8040014,
     clre_clear_all=(1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
-    status=0xF8040004, wait="reqdone")
+    status=0xF8040004, wait="reqdone", load_lo=0x55F4, load_hi=0x55F4)
 
 FLASH_PROFILES = {"tc3xx": PROFILE_TC3XX, "tc4xx": PROFILE_TC4XX}
 
@@ -190,8 +195,8 @@ class Flash:
             raise DapError("0x%08X is not a programmable flash page" % page_addr)
 
     def load_page(self, word_lo, word_hi):
-        self._cmd(0x55F0, word_lo)
-        self._cmd(0x55F4, word_hi)
+        self._cmd(self.p.load_lo, word_lo)
+        self._cmd(self.p.load_hi, word_hi)
 
     def write_page(self, page_addr):
         page_addr = _prog_alias(page_addr)
@@ -236,7 +241,7 @@ class Flash:
         self.clear_errors()
         return blank
 
-    def program_page(self, page_addr, page_bytes, busy_mask):
+    def program_page(self, page_addr, page_bytes):
         """Program one aligned page (32 B PFLASH / 8 B DFLASH), padded with 0xFF."""
         page_len = len(page_bytes)
         self.enter_page_mode(page_addr)
@@ -245,7 +250,7 @@ class Flash:
             self.load_page(int.from_bytes(chunk[0:4], "little"),
                            int.from_bytes(chunk[4:8], "little"))
         self.write_page(page_addr)
-        self.wait_unbusy(busy_mask)
+        self._wait_cmd_done(page_addr)
 
 
 def _read_region(dap, addr, length):
@@ -410,10 +415,10 @@ def read_region_blankcheck(dap, addr, length, sector=PFLASH_LOG_SECTOR,
     return segments, missed, unreadable
 
 
-def _program(dap, image, args):
+def _program(dap, image, args, family="tc3xx"):
     """Erase (optional) + program + verify every segment. Raises DapError on a
     transport/flash fault; returns an exit code."""
-    flash = Flash(dap)
+    flash = Flash(dap, family)
     flash.clear_status()
 
     if args.erase == "sectors":
@@ -424,18 +429,17 @@ def _program(dap, image, args):
             first, count = _pflash_sectors(segment.addr, len(segment.data))
             log("tcprog: erase %d sector(s) from 0x%08X" % (count, first), verbose=True)
             flash.erase_sectors(first, count)
-            flash.wait_unbusy(_busy_mask(segment.addr))
+            flash._wait_cmd_done(segment.addr)
 
     for segment in image.segments:
         page = PFLASH_PAGE if _busy_mask(segment.addr) != 0x01 else DFLASH_PAGE
-        mask = _busy_mask(segment.addr)
         data, base = segment.data, segment.addr & ~(page - 1)
         pad_front = segment.addr - base
         buf = b"\xFF" * pad_front + data
         if len(buf) % page:
             buf += b"\xFF" * (page - len(buf) % page)
         for off in range(0, len(buf), page):
-            flash.program_page(base + off, buf[off:off + page], mask)
+            flash.program_page(base + off, buf[off:off + page])
         if not args.quiet:
             sys.stderr.write("\r  programmed %d/%d bytes" % (segment.end - segment.addr,
                                                              image.total_bytes))

@@ -73,15 +73,6 @@ def _decode_jtagid(v):
     return {"version": (v >> 28) & 0xF, "part": (v >> 12) & 0xFFFF, "manuf": (v >> 1) & 0x7FF}
 
 
-def _refuse_tc4(chip, what):
-    """TC4xx: identity, reads and BMHD decode only. Its flash/unlock paths are not
-    ported, and the TC2xx/TC3xx sequences must not run against it. -> exit code or None."""
-    if chip is not None and chip.family == "tc4xx":
-        return _error("%s is not supported on %s yet (TC4xx: ident, read, ucb only)"
-                      % (what, chip.name), os.EX_UNAVAILABLE)
-    return None
-
-
 def _todo(cmd):
     return _error("'%s' not implemented yet (needs the DAP/ASC-BSL transport)." % cmd,
                   os.EX_UNAVAILABLE)
@@ -752,9 +743,6 @@ def _cmd_write(args):
 
     if args.dry_run:
         return _dry_run_plan(image, args, chip)
-    refused = _refuse_tc4(chip, "write")
-    if refused is not None:
-        return refused
 
     # ALLOWLIST: every segment must sit inside one of the device's memory slices.
     # A custom --device file with only the permitted slices thus confines a write
@@ -799,7 +787,8 @@ def _cmd_write(args):
         except Fail as f:
             return _error(f, f.code)
         try:
-            return _program(dap, image, args)
+            fam = chip.family if chip.family == "tc4xx" else "tc3xx"
+            return _program(dap, image, args, family=fam)
         except DapError as error:
             return _error("flash operation failed: %s" % error, os.EX_IOERR)
 
@@ -812,9 +801,6 @@ def _cmd_erase(args):
         return _error(error, os.EX_USAGE)
     if chip is None:
         return _error("erase requires the target: pass -c/--chip or --device", os.EX_USAGE)
-    refused = _refuse_tc4(chip, "erase")
-    if refused is not None:
-        return refused
 
     addr, length, whole = args.addr, args.length, False
     if args.region:
@@ -851,11 +837,12 @@ def _cmd_erase(args):
         except Fail as f:
             return _error(f, f.code)
         try:
-            flash = Flash(dap)
+            fam = chip.family if chip.family == "tc4xx" else "tc3xx"
+            flash = Flash(dap, fam)
             flash.clear_status()
             log("tcprog: erasing %d sector(s) from 0x%08X..." % (count, first), verbose=True)
             flash.erase_sectors(first, count)
-            flash.wait_unbusy(_busy_mask(addr))
+            flash._wait_cmd_done(addr)
             flash.reset_to_read()
         except DapError as error:
             return _error("erase failed: %s" % error, os.EX_IOERR)
