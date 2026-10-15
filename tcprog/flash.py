@@ -11,7 +11,8 @@ import os
 import sys
 
 from .dap import Dap, DapError
-from .image import parse_bmhd, parse_bmhd_tc4, validate_bmhd, validate_bmhd_tc4
+from .image import (parse_bmhd_tc2, parse_bmhd_tc3, parse_bmhd_tc4,
+                    validate_bmhd_tc2, validate_bmhd_tc3, validate_bmhd_tc4)
 from .util import EX_VERIFY, Fail, _error, log
 
 FSI_BASE = 0xAF000000               # TC3xx command base (back-compat default)
@@ -516,7 +517,9 @@ def read_words(dap, addr, size):
     return bytes(out)
 
 
-def _read_bmhds_tc4(dap, chip):
+def _read_ucbs_tc4(dap, chip):
+    """TC4xx: the known UCBs are the four BMHD blocks, each with a confirmation
+    word and a copy."""
     out = []
     for name, block, _size in bmhd_blocks(chip):
         confirm = dap.read_word_retry(block + TC4_CONFIRM_OFF)
@@ -532,12 +535,10 @@ def _read_bmhds_tc4(dap, chip):
     return out
 
 
-def _read_ucbs(dap, chip):
-    """Read every known UCB's confirmation word (+ BMHD0 header). -> list of
-    dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}. On TC4xx
-    only the BMHD blocks are known."""
-    if chip is not None and chip.family == "tc4xx":
-        return _read_bmhds_tc4(dap, chip)
+def _read_classic_ucbs(dap, chip, bmhd_nbytes, parse, validate):
+    """Shared TC2xx/TC3xx UCB read: every known UCB's confirmation word, plus the
+    BMHD0 header. The BMHD block map (UCB_BLOCKS at ucb.base) is the same for both
+    families; only the BMHD format differs (16 B TC3xx, 32 B TC2xx), passed in."""
     ucb = chip.first("ucb") if chip else None
     if ucb is None:
         raise Fail("no UCB region known for this target; pass -c/--chip or --device",
@@ -555,8 +556,29 @@ def _read_ucbs(dap, chip):
                  "bmhd": None}
         if name.startswith("bmhd"):
             header = b"".join((dap.try_read_word(block + off) or 0).to_bytes(4, "little")
-                              for off in range(0, 16, 4))
-            entry["bmhd"] = parse_bmhd(header)
-            entry["bmhd_ok"], entry["bmhd_problems"] = validate_bmhd(header, chip)
+                              for off in range(0, bmhd_nbytes, 4))
+            entry["bmhd"] = parse(header)
+            entry["bmhd_ok"], entry["bmhd_problems"] = validate(header, chip)
         out.append(entry)
     return out
+
+
+def _read_ucbs_tc2(dap, chip):
+    """TC2xx (AURIX 1G): 32-byte BMHD format (STADBM | BMI|BMHDID | range | CRC)."""
+    return _read_classic_ucbs(dap, chip, 32, parse_bmhd_tc2, validate_bmhd_tc2)
+
+
+def _read_ucbs_tc3(dap, chip):
+    """TC3xx: 16-byte BMHD format (BMI | BMHDID | STAD | CRC)."""
+    return _read_classic_ucbs(dap, chip, 16, parse_bmhd_tc3, validate_bmhd_tc3)
+
+
+def _read_ucbs(dap, chip):
+    """Read every known UCB's confirmation word (+ BMHD0 header). -> list of
+    dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}. On TC4xx
+    only the BMHD blocks are known."""
+    if chip is not None and chip.family == "tc4xx":
+        return _read_ucbs_tc4(dap, chip)
+    if chip is not None and chip.family == "tc2xx":
+        return _read_ucbs_tc2(dap, chip)
+    return _read_ucbs_tc3(dap, chip)

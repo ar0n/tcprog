@@ -517,7 +517,7 @@ def _cmd_ucb(args):
                                "bmhd": None if u["bmhd"] is None else
                                {"bmi": "0x%04X" % u["bmhd"]["bmi"],
                                 "hwcfg": u["bmhd"].get("hwcfg"),
-                                "stad": "0x%08X" % u["bmhd"]["stad"],
+                                "stad": "0x%08X" % u["bmhd"].get("stad", u["bmhd"].get("stadbm")),
                                 "valid": u["bmhd_ok"]}} for u in ucbs]))
         elif action == "decode":
             print("UCBs (%s):" % chip.name)
@@ -527,7 +527,7 @@ def _cmd_ucb(args):
                     b = u["bmhd"]
                     mode = ("hwcfg=0x%X" % b["hwcfg"]) if "hwcfg" in b else ("bmi=0x%04X" % b["bmi"])
                     print("          BMHD %s stad=0x%08X crc=%s"
-                          % (mode, b["stad"], "ok" if u["bmhd_ok"] else "BAD"))
+                          % (mode, b.get("stad", b.get("stadbm")), "ok" if u["bmhd_ok"] else "BAD"))
                     for problem in u["bmhd_problems"]:
                         print("          ! %s" % problem)
 

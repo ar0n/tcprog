@@ -135,7 +135,7 @@ def crc32_bmhd(header):
     return zlib.crc32(swapped) & 0xFFFFFFFF
 
 
-def parse_bmhd(data):
+def parse_bmhd_tc3(data):
     if len(data) < 16:
         raise ValueError("BMHD is 16 bytes")
     bmi = int.from_bytes(data[0:2], "little")
@@ -146,11 +146,11 @@ def parse_bmhd(data):
             "crcbmhd_n": int.from_bytes(data[12:16], "little")}
 
 
-def validate_bmhd(data, chip=None):
+def validate_bmhd_tc3(data, chip=None):
     problems = []
     if len(data) < 16:
         return False, ["shorter than 16 bytes"]
-    header = parse_bmhd(data)
+    header = parse_bmhd_tc3(data)
     if header["bmhdid"] != BMHDID:
         problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
     if header["hwcfg"] not in VALID_HWCFG:
@@ -167,6 +167,53 @@ def validate_bmhd(data, chip=None):
         problems.append("CRCBMHD 0x%08X != 0x%08X" % (header["crcbmhd"], expected))
     if header["crcbmhd_n"] != (~expected & 0xFFFFFFFF):
         problems.append("CRCBMHD_N invalid")
+    return (not problems), problems
+
+
+# TC2xx (AURIX 1G) Boot Mode Header, 32 bytes, from the TC2xx iLLD
+# BootModeHeader_0 (IfxCpu_CStart0.c). Layout differs from TC3xx: STADBM comes
+# first, then BMI|BMHDID in word 1, a CRC-checked code range (ChkStart..ChkEnd +
+# CRCrange/!CRCrange), and finally CRChead/!CRChead over the first 24 bytes.
+# The TC2xx BMI bit layout is not the TC3xx BMI[3:1]/[0] one, so BMI is raw.
+def parse_bmhd_tc2(data):
+    if len(data) < 32:
+        raise ValueError("TC2xx BMHD is 32 bytes")
+    word1 = int.from_bytes(data[4:8], "little")   # BMHDID<<16 | BMI
+    return {"stadbm": int.from_bytes(data[0:4], "little"),
+            "bmi": word1 & 0xFFFF,
+            "bmhdid": (word1 >> 16) & 0xFFFF,
+            "chkstart": int.from_bytes(data[8:12], "little"),
+            "chkend": int.from_bytes(data[12:16], "little"),
+            "crcrange": int.from_bytes(data[16:20], "little"),
+            "crcrange_n": int.from_bytes(data[20:24], "little"),
+            "crchead": int.from_bytes(data[24:28], "little"),
+            "crchead_n": int.from_bytes(data[28:32], "little")}
+
+
+def validate_bmhd_tc2(data, chip=None):
+    if len(data) < 32:
+        return False, ["shorter than 32 bytes"]
+    header = parse_bmhd_tc2(data)
+    problems = []
+    if header["bmhdid"] != BMHDID:
+        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
+    if header["stadbm"] & 0x3:
+        problems.append("STADBM 0x%08X not word-aligned" % header["stadbm"])
+    in_pflash = ((header["stadbm"] & 0xDF000000) == 0x80000000)
+    if chip is not None:
+        in_pflash = any(sl.contains(header["stadbm"]) for sl in chip.slices("pflash"))
+    if not in_pflash:
+        problems.append("STADBM 0x%08X not in program flash" % header["stadbm"])
+    # CRChead covers STADBM..!CRCrange (the first 24 bytes), so it already
+    # authenticates the CRCrange/!CRCrange fields; no separate inverted-pair check
+    # is needed (and the iLLD leaves both 0 when the range check is unused).
+    # CRCrange itself covers the user code range, which the header alone cannot
+    # recompute.
+    expected = crc32_bmhd(data[0:24])
+    if header["crchead"] != expected:
+        problems.append("CRCHEAD 0x%08X != 0x%08X" % (header["crchead"], expected))
+    if header["crchead_n"] != (~expected & 0xFFFFFFFF):
+        problems.append("CRCHEAD_N invalid")
     return (not problems), problems
 
 
