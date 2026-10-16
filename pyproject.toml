@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tcprog"
 version = "0.1.0"
-description = "AURIX TC2xx/TC3xx flash programmer over an FTDI-MPSSE DAP or ASC BSL"
+description = "AURIX TC2xx/TC3xx/TC4xx flash programmer over an FTDI-MPSSE DAP or ASC BSL"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Aron Szabo", email = "aron@aron.ws"}]

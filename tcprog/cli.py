@@ -20,7 +20,7 @@ from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _flash_secto
 from .image import load_image, _emit, _hexdump, _out_format
 from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
 
-DESCRIPTION = "AURIX TC2xx/TC3xx flash programmer over an FTDI-MPSSE DAP or ASC BSL."
+DESCRIPTION = "AURIX TC2xx/TC3xx/TC4xx flash programmer over an FTDI-MPSSE DAP or ASC BSL."
 
 EPILOG = r"""examples:
   tcprog list probes
@@ -295,7 +295,7 @@ def _build_parser():
                                             "controller's hardware blank-check",
                          description="Report which PFLASH sectors are programmed, using the "
                                      "flash controller's Verify-Erased command (no array "
-                                     "reads, no ECC traps). Non-destructive. TC3xx only.")
+                                     "reads, no ECC traps). Non-destructive. TC3xx and TC4xx.")
     _add_conn_args(pbc)
     gbc = pbc.add_argument_group("blankcheck")
     gbc.add_argument("--addr", type=_hexint, help="start address (rounded down to a sector)")
@@ -841,9 +841,9 @@ def _cmd_erase(args):
         try:
             flash = Flash(dap, fam)
             flash.clear_status()
+            flash.clear_errors()
             log("tcprog: erasing %d sector(s) from 0x%08X..." % (count, first), verbose=True)
-            flash.erase_sectors(first, count)
-            flash._wait_cmd_done(addr)
+            flash.erase_range(first, count, sector)
             flash.reset_to_read()
         except DapError as error:
             return _error("erase failed: %s" % error, os.EX_IOERR)

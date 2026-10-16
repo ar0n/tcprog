@@ -25,8 +25,17 @@ FSI_VERIFY_ERASED_CYCLE2 = 0x5F
 PFLASH_PAGE, DFLASH_PAGE = 32, 8    # IFXFLASH_{PFLASH,DFLASH}_PAGE_LENGTH
 PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (TC3xx 6 MB / TC4 20 MB)
 
-# TC4 HCI_STATUS completion handshake (IfxFlash_isRequestReceived/Executed).
+# TC4 HCI_STATUS completion handshake (IfxFlash_isRequestReceived/Executed)
+# and the page-mode flags (TC4Dx UM v1.1 HCI_STATUS).
 HCI_REQACK, HCI_REQDONE = 1 << 30, 1 << 31
+HCI_DFPAGE, HCI_PFPAGE = 1 << 24, 1 << 25
+
+# Largest range one Erase Logical Sector Range may cover (TC4Dx UM 5.3.8.13:
+# PFLASH <= 512 KB, DFLASH <= 256 KB, inside one bank; the count is 8-bit).
+# Chunks are aligned to these sizes, so they never straddle a bank (PFLASH banks
+# are 512 KB multiples on TC3xx and TC4). Also applied to TC3xx: splitting
+# smaller than the hardware limit is always safe.
+ERASE_MAX_PFLASH, ERASE_MAX_DFLASH = 512 * 1024, 256 * 1024
 
 
 class FlashProfile:
@@ -215,6 +224,41 @@ class Flash:
                 raise DapError("flash cmd not done past %.1fs (HCI_STATUS=0x%08X)"
                                % (timeout, status))
 
+    def _begin_cmd(self):
+        """TC4: Clear Status before each command sequence. Only Clear Status (or
+        Reset to Read) resets REQACK/REQDONE, so without it a REQDONE wait sees
+        the previous command's completion (UM 5.3.10.2). TC3xx waits on the BUSY
+        bits instead and needs nothing here."""
+        if self.p.wait == "reqdone":
+            self.clear_status()
+
+    def check_errors(self, what, fail_mask=0):
+        """Raise if the last command was rejected (OPER/SQER/PROER) or failed one
+        of fail_mask (PVER after a write, EVER after an erase). A rejected command
+        leaves the interpreter in ERROR MODE, so Reset to Read before raising."""
+        errsr = self.dap.read_word(self.p.errsr)
+        if errsr & (self.p.reject_mask | fail_mask):
+            self.reset_to_read()
+            self.clear_errors()
+            raise DapError("%s failed (%s=0x%08X)" % (what, self.p.errsr_name, errsr))
+
+    def _wait_page_mode(self, page_addr, timeout=1.0):
+        """TC4: wait for HCI_STATUS.PFPAGE/DFPAGE after Enter Page Mode, failing
+        early on a sequence/protection error (UM 5.3.10.2)."""
+        import time
+        bit = HCI_PFPAGE if _is_pflash(_prog_alias(page_addr)) else HCI_DFPAGE
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.dap.try_read_word(self.p.status)
+            if status is None:
+                raise DapError("HCI_STATUS unreadable during flash op")
+            if status & bit:
+                return
+            self.check_errors("enter page mode at 0x%08X" % page_addr)
+            if time.monotonic() > deadline:
+                raise DapError("page mode not entered past %.1fs (HCI_STATUS=0x%08X)"
+                               % (timeout, status))
+
     def enter_page_mode(self, page_addr):
         page_addr = _prog_alias(page_addr)
         if _is_pflash(page_addr):
@@ -240,6 +284,21 @@ class Flash:
         self._cmd(0xAA58, count)
         self._cmd(0xAAA8, 0x80)
         self._cmd(0xAAA8, FSI_ERASE_CYCLE2)
+
+    def erase_range(self, first, count, sector, timeout=10.0):
+        """Erase `count` logical sectors of size `sector` from `first`, split
+        into commands that stay within ERASE_MAX_* and one bank, each waited for
+        and error-checked (EVER = erase verify error)."""
+        limit = ERASE_MAX_PFLASH if _is_pflash(_prog_alias(first)) else ERASE_MAX_DFLASH
+        addr, end = first, first + count * sector
+        while addr < end:
+            stop = min((addr // limit + 1) * limit, end)
+            n = (stop - addr) // sector
+            self._begin_cmd()
+            self.erase_sectors(addr, n)
+            self._wait_cmd_done(addr, timeout)
+            self.check_errors("erase %d sector(s) at 0x%08X" % (n, addr), self.p.ever)
+            addr = stop
 
     def clear_errors(self):
         """Clear the DMU error latches so a following verify reads clean."""
@@ -274,13 +333,19 @@ class Flash:
     def program_page(self, page_addr, page_bytes):
         """Program one aligned page (32 B PFLASH / 8 B DFLASH), padded with 0xFF."""
         page_len = len(page_bytes)
+        self._begin_cmd()
         self.enter_page_mode(page_addr)
+        if self.p.wait == "reqdone":
+            self._wait_page_mode(page_addr)
+        self._begin_cmd()
         for off in range(0, page_len, 8):
             chunk = page_bytes[off:off + 8].ljust(8, b"\xFF")
             self.load_page(int.from_bytes(chunk[0:4], "little"),
                            int.from_bytes(chunk[4:8], "little"))
+        self._begin_cmd()
         self.write_page(page_addr)
         self._wait_cmd_done(page_addr)
+        self.check_errors("program page 0x%08X" % page_addr, self.p.pver)
 
 
 def _read_region(dap, addr, length):
@@ -450,6 +515,7 @@ def _program(dap, image, args, family="tc3xx"):
     transport/flash fault; returns an exit code."""
     flash = Flash(dap, family)
     flash.clear_status()
+    flash.clear_errors()
 
     if args.erase == "sectors":
         for segment in image.segments:
@@ -459,8 +525,7 @@ def _program(dap, image, args, family="tc3xx"):
                              "for 0x%08X" % segment.addr, os.EX_USAGE)
             first, count = _flash_sectors(segment.addr, len(segment.data), sector)
             log("tcprog: erase %d sector(s) from 0x%08X" % (count, first), verbose=True)
-            flash.erase_sectors(first, count)
-            flash._wait_cmd_done(segment.addr)
+            flash.erase_range(first, count, sector)
 
     for segment in image.segments:
         page = DFLASH_PAGE if _is_dflash(segment.addr, flash.p) else PFLASH_PAGE
