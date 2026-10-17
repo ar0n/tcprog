@@ -51,7 +51,8 @@ class FlashProfile:
     """
     def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
                  reject_mask, clre, clre_clear_all, status, wait,
-                 load_lo, load_hi, dflash_hi, dflash_sector):
+                 load_lo, load_hi, dflash_hi, dflash_sector,
+                 protect, unprotect):
         self.cmd_base = cmd_base
         self.errsr = errsr
         self.errsr_name = errsr_name
@@ -71,6 +72,10 @@ class FlashProfile:
         # 0x80/0xA0 and 16 KiB on both; DFLASH page is 8 B on both.
         self.dflash_hi = dflash_hi              # high byte of a DFLASH address
         self.dflash_sector = dflash_sector
+        # Disable Protection: the status register, and per flash ("pflash" /
+        # "dflash") the UCB selector and the status bit that confirms it.
+        self.protect = protect
+        self.unprotect = unprotect
 
 
 # TC3xx 2G DMU (Infra/Sfr IfxDmu_regdef.h): HF_* registers. EVER bit4, PVER
@@ -81,7 +86,10 @@ PROFILE_TC3XX = FlashProfile(
     reject_mask=(1 << 0) | (1 << 1) | (1 << 2),
     clre=0xF8040038, clre_clear_all=(1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
     status=0xF8040010, wait="busy", load_lo=0x55F0, load_hi=0x55F4,
-    dflash_hi=0xAF, dflash_sector=0x1000)
+    dflash_hi=0xAF, dflash_sector=0x1000,
+    protect=0xF804001C,                        # HF_PROTECT
+    unprotect={"pflash": (0x10, 1 << 0),       # UCB_PFLASH, PRODISP
+               "dflash": (0x11, 1 << 1)})      # UCB_DFLASH, PRODISD
 
 # TC4Dx DMU (Infra/Sfr/TC4Dx IfxDmu_reg.h + IfxDmu_bf.h): HCI_* registers.
 # Command base 0xF8080000 (IfxFlash_cfg_TC4Dx.h IFXFLASH_CMD_BASE_ADDRESS).
@@ -95,7 +103,11 @@ PROFILE_TC4XX = FlashProfile(
     clre=0xF8040014,
     clre_clear_all=(1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
     status=0xF8040004, wait="reqdone", load_lo=0x55F4, load_hi=0x55F4,
-    dflash_hi=0xAE, dflash_sector=0x800)
+    dflash_hi=0xAE, dflash_sector=0x800,
+    protect=0xF804052C,                        # GP_HOST_PROTECT
+    # One UCB_RTC_FLASH covers both: selector 0x10 lifts global read and write
+    # protection of HOST PFLASH and DFLASH and sets PRODISFL.
+    unprotect={"pflash": (0x10, 1 << 13), "dflash": (0x10, 1 << 13)})
 
 FLASH_PROFILES = {"tc3xx": PROFILE_TC3XX, "tc4xx": PROFILE_TC4XX}
 
@@ -299,6 +311,31 @@ class Flash:
             self._wait_cmd_done(addr, timeout)
             self.check_errors("erase %d sector(s) at 0x%08X" % (n, addr), self.p.ever)
             addr = stop
+
+    def disable_protection(self, which, words):
+        """Disable Protection for "pflash" or "dflash" with the 8-word password.
+        -> True if it was already disabled, False if this call disabled it.
+        Raises DapError if the password is refused; the DMU then refuses every
+        further attempt until the next reset."""
+        uc, bit = self.p.unprotect[which]
+        if self.dap.read_word(self.p.protect) & bit:
+            return True
+        self.clear_errors()
+        self._begin_cmd()
+        self._cmd(0x553C, uc)
+        for word in words:
+            self._cmd(0x553C, word & 0xFFFFFFFF)
+        if self.p.wait == "reqdone":
+            self._wait_cmd_done(0)
+        errsr = self.dap.read_word(self.p.errsr)
+        status = self.dap.read_word(self.p.protect)
+        if errsr & self.p.reject_mask or not status & bit:
+            self.reset_to_read()
+            self.clear_errors()
+            raise DapError("%s protection: password refused (%s=0x%08X, protect=0x%08X); "
+                           "a reset is needed before trying again"
+                           % (which.upper(), self.p.errsr_name, errsr, status))
+        return False
 
     def clear_errors(self):
         """Clear the DMU error latches so a following verify reads clean."""

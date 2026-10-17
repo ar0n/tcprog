@@ -151,7 +151,7 @@ def _add_conn_args(p):
     b.add_argument("--asc-bsl-port", help="serial port for ASC BSL")
     b.add_argument("--asc-bsl-baud", type=int, default=115200, help="ASC BSL baud [default: 115200]")
 
-    s = p.add_argument_group("security (TC3xx protection - run ident first)")
+    s = p.add_argument_group("security (TC3xx/TC4xx protection - run ident first)")
     s.add_argument("--debug-unlock-pw", default=os.environ.get("TCPROG_DEBUG_UNLOCK_PW"),
                    help="256-bit debug/JTAG password: 8 words w0,..,w7 (dec/0x-hex), or "
                         "one value repeated 8x. Env: TCPROG_DEBUG_UNLOCK_PW")
@@ -346,8 +346,51 @@ def _read_identity(dap, chip=None):
 
 def _unlock_if_locked(dap, args, chip=None):
     """Read the identity register; if the part is debug-locked, unlock with
-    --debug-unlock-pw. -> (id_addr, id_value). Raises Fail (locked=True when no
-    password was given)."""
+    --debug-unlock-pw; then disable flash protection if asked. -> (id_addr,
+    id_value). Raises Fail (locked=True when no password was given)."""
+    addr, chipid = _debug_unlock(dap, args, chip)
+    _disable_flash_protection(dap, args, chip)
+    return addr, chipid
+
+
+def _disable_flash_protection(dap, args, chip):
+    """--pflash-unlock-pw / --dflash-unlock-pw: Disable Protection with that
+    flash's password (or the debug password when given without a value). On
+    TC4xx one UCB_RTC_FLASH password covers both."""
+    wanted = [(which, value) for which, value in (("pflash", args.pflash_unlock_pw),
+                                                  ("dflash", args.dflash_unlock_pw))
+              if value is not None]
+    if not wanted:
+        return
+    if chip is None:
+        raise Fail("flash unlock needs the target: pass -c/--chip", os.EX_USAGE)
+    if chip.family not in ("tc3xx", "tc4xx"):
+        raise Fail("flash unlock is not supported on %s yet" % chip.family,
+                   os.EX_UNAVAILABLE)
+    flash = Flash(dap, chip.family)
+    done = set()
+    for which, value in wanted:
+        text = value or args.debug_unlock_pw
+        if not text:
+            raise Fail("--%s-unlock-pw needs a value (no --debug-unlock-pw to reuse)"
+                       % which, os.EX_USAGE)
+        try:
+            words = parse_password(text)
+        except ValueError as error:
+            raise Fail(str(error), os.EX_USAGE)
+        key = flash.p.unprotect[which]
+        if key in done:
+            continue
+        try:
+            already = flash.disable_protection(which, words)
+        except DapError as error:
+            raise Fail(str(error), os.EX_NOPERM)
+        done.add(key)
+        log("tcprog: %s protection %s" % (which.upper(), "was already disabled"
+                                          if already else "disabled"), verbose=True)
+
+
+def _debug_unlock(dap, args, chip=None):
     addr, chipid = _read_identity(dap, chip)
     if not _locked(chipid):
         return addr, chipid
