@@ -30,11 +30,11 @@ PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (TC3xx 6 MB / TC4 20
 HCI_REQACK, HCI_REQDONE = 1 << 30, 1 << 31
 HCI_DFPAGE, HCI_PFPAGE = 1 << 24, 1 << 25
 
-# Largest range one Erase Logical Sector Range may cover (TC4Dx UM 5.3.8.13:
-# PFLASH <= 512 KB, DFLASH <= 256 KB, inside one bank; the count is 8-bit).
-# Chunks are aligned to these sizes, so they never straddle a bank (PFLASH banks
-# are 512 KB multiples on TC3xx and TC4). Also applied to TC3xx: splitting
-# smaller than the hardware limit is always safe.
+# Largest range one Erase Logical Sector Range may cover: PFLASH <= 512 KB,
+# DFLASH <= 256 KB, a UCB range at most one UCB, all inside one physical sector
+# or bank; the count is 8-bit.
+# Chunks are aligned to these sizes, so they never straddle a physical sector
+# (PFLASH sectors/banks are 1 MB-aligned on both families).
 ERASE_MAX_PFLASH, ERASE_MAX_DFLASH = 512 * 1024, 256 * 1024
 
 
@@ -51,7 +51,7 @@ class FlashProfile:
     """
     def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
                  reject_mask, clre, clre_clear_all, status, wait,
-                 load_lo, load_hi, dflash_hi, dflash_sector,
+                 load_lo, load_hi, dflash_hi, dflash_sector, ucb_ranges, ucb_sector,
                  protect, unprotect):
         self.cmd_base = cmd_base
         self.errsr = errsr
@@ -72,6 +72,10 @@ class FlashProfile:
         # 0x80/0xA0 and 16 KiB on both; DFLASH page is 8 B on both.
         self.dflash_hi = dflash_hi              # high byte of a DFLASH address
         self.dflash_sector = dflash_sector
+        # UCB windows [(base, size)] and the UCB logical-sector size: one erase
+        # command may cover at most one UCB.
+        self.ucb_ranges = ucb_ranges
+        self.ucb_sector = ucb_sector
         # Disable Protection: the status register, and per flash ("pflash" /
         # "dflash") the UCB selector and the status bit that confirms it.
         self.protect = protect
@@ -87,6 +91,7 @@ PROFILE_TC3XX = FlashProfile(
     clre=0xF8040038, clre_clear_all=(1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
     status=0xF8040010, wait="busy", load_lo=0x55F0, load_hi=0x55F4,
     dflash_hi=0xAF, dflash_sector=0x1000,
+    ucb_ranges=((0xAF400000, 0x6000),), ucb_sector=0x200,
     protect=0xF804001C,                        # HF_PROTECT
     unprotect={"pflash": (0x10, 1 << 0),       # UCB_PFLASH, PRODISP
                "dflash": (0x11, 1 << 1)})      # UCB_DFLASH, PRODISD
@@ -104,6 +109,7 @@ PROFILE_TC4XX = FlashProfile(
     clre_clear_all=(1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
     status=0xF8040004, wait="reqdone", load_lo=0x55F4, load_hi=0x55F4,
     dflash_hi=0xAE, dflash_sector=0x800,
+    ucb_ranges=((0xAE400000, 0x14000), (0xAEC00000, 0xD000)), ucb_sector=0x800,
     protect=0xF804052C,                        # GP_HOST_PROTECT
     # One UCB_RTC_FLASH covers both: selector 0x10 lifts global read and write
     # protection of HOST PFLASH and DFLASH and sets PRODISFL.
@@ -131,7 +137,10 @@ UCB_BLOCKS = (("bmhd0", 0x00), ("pflash", 0x10), ("dflash", 0x11), ("dbg", 0x12)
 TC2_UCB_CONFIRM_OFF = 0x70
 TC2_UCB_BLOCKS = (("pflash", 0x00), ("dflash", 0x01), ("dbg", 0x05))
 TC2_BMHD0, TC2_BMHD_SIZE = 0xA0000000, 32
-_CONFIRM = {0x43211234: "UNCONFIRMED", 0x57B5327F: "CONFIRMED", 0x00000000: "ERASED"}
+# 0x43211234 is UNLOCKED on all three families; any value other than
+# UNLOCKED/CONFIRMED, erased included, is ERRORED.
+_CONFIRM = {0x43211234: "UNLOCKED", 0x57B5327F: "CONFIRMED",
+            0x00000000: "ERASED (errored)"}
 
 # TC4xx: four 2 KiB BMHD blocks (iLLD Lcf .bmhd_N_org, Ifx_Ssw_Bmhd), each with
 # the 8-word password at +0x7D0 and the confirmation word (+ a copy) at +0x7F0/8.
@@ -144,16 +153,20 @@ def _ucb_stride(family):
 
 
 def _prog_alias(addr):
-    """Map an uncached PFLASH address (0x80xxxxxx) to the 0xA0xxxxxx alias the
-    FSI enter-page-mode check requires; DFLASH (0xAFxxxxxx) is left as-is."""
+    """Map a cached PFLASH address (0x80xxxxxx) to the non-cached 0xA0xxxxxx
+    alias that command parameters must use; DFLASH/UCB addresses are left as-is."""
     if (addr & 0xFF000000) == 0x80000000:
         return (addr & 0x00FFFFFF) | 0xA0000000
     return addr
 
 
 def _busy_mask(addr):
-    """HF_STATUS busy bits for the flash the address lives in: PFLASH P0|P1, DFLASH D0."""
-    return 0x01 if (addr & 0xFF000000) == 0xAF000000 else (1 << 2) | (1 << 3)
+    """TC3xx HF_STATUS busy bits for the flash the address lives in: DFLASH1
+    (0xAFC00000+) D1BUSY bit 1, the rest of 0xAFxxxxxx (DFLASH0, UCB, CFS)
+    D0BUSY bit 0, PFLASH any of P0BUSY..P5BUSY (bits 2..7)."""
+    if (addr & 0xFF000000) == 0xAF000000:
+        return 0x02 if addr >= 0xAFC00000 else 0x01
+    return 0xFC
 
 
 def _is_pflash(addr):
@@ -166,11 +179,18 @@ def _is_dflash(addr, p):
     return (addr >> 24) == p.dflash_hi
 
 
+def _is_ucb(addr, p):
+    return any(base <= addr < base + size for base, size in p.ucb_ranges)
+
+
 def _sector_size(addr, p):
-    """Logical-sector size for the flash addr lives in: 16 KiB PFLASH, the
-    family's DFLASH sector for DFLASH, or None if addr is neither."""
+    """Logical-sector size for the flash addr lives in: 16 KiB PFLASH, one UCB
+    for a UCB address, the family's DFLASH sector for the rest of DFLASH, or
+    None if addr is neither."""
     if _is_pflash(addr):
         return PFLASH_LOG_SECTOR
+    if _is_ucb(addr, p):
+        return p.ucb_sector
     if _is_dflash(addr, p):
         return p.dflash_sector
     return None
@@ -305,7 +325,12 @@ class Flash:
         """Erase `count` logical sectors of size `sector` from `first`, split
         into commands that stay within ERASE_MAX_* and one bank, each waited for
         and error-checked (EVER = erase verify error)."""
-        limit = ERASE_MAX_PFLASH if _is_pflash(_prog_alias(first)) else ERASE_MAX_DFLASH
+        if _is_pflash(_prog_alias(first)):
+            limit = ERASE_MAX_PFLASH
+        elif _is_ucb(first, self.p):
+            limit = self.p.ucb_sector          # one UCB per command
+        else:
+            limit = ERASE_MAX_DFLASH
         addr, end = first, first + count * sector
         while addr < end:
             stop = min((addr // limit + 1) * limit, end)
