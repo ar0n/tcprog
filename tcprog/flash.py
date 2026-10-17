@@ -723,6 +723,61 @@ def _read_ucbs_tc3(dap, chip):
     return _read_classic_ucbs(dap, chip, 16, parse_bmhd_tc3, validate_bmhd_tc3)
 
 
+# TC3xx next-boot check. Each (name, UCB ORIG address, config-word offset, live
+# register); COPY is ORIG + 0x1000. ORIG is used unless its confirmation code is
+# neither UNLOCKED nor CONFIRMED, then COPY.
+_TC3_NEXT_BOOT = (("pflash", 0xAF402000, 0x0C0, 0xF8040080),   # PROCONPF
+                  ("dflash", 0xAF402200, 0x004, 0xF8040088),   # PROCONDF
+                  ("dbg", 0xAF402400, 0x000, 0xF8040090))      # PROCONDBG
+_RPRO, _DF_L, _DBGIFLCK = 1 << 31, 1 << 0, 1 << 1
+
+
+def next_boot_report(dap, chip):
+    """TC3xx: compare the protection the UCBs will install at the next reset with
+    the live DMU registers. -> list of (level, message), level "ok" / "warn" /
+    "lockout". Read-only. Empty for other families."""
+    if chip is None or chip.family != "tc3xx":
+        return []
+    nxt, live, notes = {}, {}, []
+    for name, orig, off, reg in _TC3_NEXT_BOOT:
+        live[name] = dap.try_read_word(reg)
+        value = None
+        for block in (orig, orig + 0x1000):
+            confirm = dap.try_read_word(block + UCB_CONFIRM_OFF)
+            if confirm is None:                     # CONFIRMED UCBs are read-protected
+                notes.append(("warn", "UCB_%s is CONFIRMED (read-protected); its next-boot "
+                              "setting cannot be checked and is hard to undo" % name.upper()))
+                break
+            if confirm in (0x43211234, 0x57B5327F):
+                value = dap.try_read_word(block + off)
+                break
+        nxt[name] = value
+    out = list(notes)
+    fields = (("pflash", _RPRO, "PFLASH read protection"),
+              ("dflash", _RPRO, "DFLASH read protection"),
+              ("dflash", _DF_L, "DFLASH write protection"),
+              ("dbg", _DBGIFLCK, "debug lock (DBGIFLCK)"))
+    for name, bit, label in fields:
+        if nxt[name] is None or live[name] is None:
+            continue
+        now, then = bool(live[name] & bit), bool(nxt[name] & bit)
+        if now != then:
+            out.append(("warn", "%s changes at the next reset: %s -> %s"
+                        % (label, "on" if now else "off", "on" if then else "off")))
+    if None not in (nxt["pflash"], nxt["dflash"], nxt["dbg"]):
+        rpro = (nxt["pflash"] | nxt["dflash"]) & _RPRO
+        if rpro and not nxt["dbg"] & _DBGIFLCK:
+            out.append(("lockout", "after the next reset flash read protection keeps debug "
+                        "locked and no debug password is configured: the part will not be "
+                        "reachable over DAP. Do not reset; undo the UCB change first."))
+        elif rpro:
+            out.append(("warn", "after the next reset debug opens only with the UCB_DBG "
+                        "password (--debug-unlock-pw)"))
+    if not out:
+        out.append(("ok", "no protection change pending at the next reset"))
+    return out
+
+
 def _read_ucbs(dap, chip):
     """Read every known UCB's confirmation word (+ BMHD0 header). -> list of
     dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}. On TC4xx

@@ -16,7 +16,7 @@ from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
 from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _flash_sectors,
                     _is_dflash, _is_pflash, _pflash_sectors, _program, _read_ucbs,
                     _sector_size, blank_map, bmhd_blocks, profile_for_family,
-                    read_region_blankcheck, read_region_sparse, read_words)
+                    next_boot_report, read_region_blankcheck, read_region_sparse, read_words)
 from .image import load_image, _emit, _hexdump, _out_format
 from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
 
@@ -598,6 +598,7 @@ def _cmd_ucb(args):
             if action == "export":
                 return _export_bmhds(dap, chip, args)
             ucbs = _read_ucbs(dap, chip)
+            boot = next_boot_report(dap, chip)
         except Fail as f:
             return _error(f, f.code)
 
@@ -620,9 +621,13 @@ def _cmd_ucb(args):
                           % (mode, b.get("stad", b.get("stadbm")), "ok" if u["bmhd_ok"] else "BAD"))
                     for problem in u["bmhd_problems"]:
                         print("          ! %s" % problem)
+            if boot:
+                print("Next boot:")
+                for level, message in boot:
+                    print("  %-7s %s" % (level.upper(), message))
 
         if action == "verify":
-            problems = []
+            problems = ["next boot: %s" % m for level, m in boot if level == "lockout"]
             for u in ucbs:
                 if u["confirm"] is not None and u["confirm"] not in _CONFIRM:
                     problems.append("%s confirm word 0x%08X unrecognized"
