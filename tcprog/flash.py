@@ -572,14 +572,18 @@ def bmhd_blocks(chip):
 
 
 def read_words(dap, addr, size):
-    """Read [addr, addr+size) one word at a time, reconnecting on a miss. -> bytes."""
+    """Read [addr, addr+size) one word at a time, reconnecting on a miss. -> bytes.
+    The DAP aligns a word read down to the word boundary, so read the aligned
+    words covering the range and slice; an unaligned addr is otherwise shifted."""
+    start = addr & ~3
+    end = (addr + size + 3) & ~3
     out = bytearray()
-    for off in range(0, size, 4):
-        value = dap.read_word_retry(addr + off)
+    for word in range(start, end, 4):
+        value = dap.read_word_retry(word)
         if value is None:
-            raise Fail("no response reading 0x%08X" % (addr + off), os.EX_IOERR)
+            raise Fail("no response reading 0x%08X" % word, os.EX_IOERR)
         out += value.to_bytes(4, "little")
-    return bytes(out)
+    return bytes(out[addr - start:addr - start + size])
 
 
 def _read_ucbs_tc4(dap, chip):
