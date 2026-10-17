@@ -49,14 +49,14 @@
             "name": "psram0",
             "kind": "psram",
             "base": "0xC0000000",
-            "size": "0x6000",
+            "size": "0x2000",
             "_note": "CPU0 PSPR; BSL loads stage 1 here (size is a family default)"
         },
         {
             "name": "dsram0",
             "kind": "dsram",
             "base": "0xD0000000",
-            "size": "0x1C000",
+            "size": "0x16000",
             "_note": "CPU0 DSPR; payload stack+CSA (size is a family default)"
         }
     ],
