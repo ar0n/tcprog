@@ -135,12 +135,11 @@ def _comdata_write(value):
 
 
 def parse_password(text):
-    """'V' (repeated 8x) or 8 comma-separated values -> list of 8 ints."""
+    """8 comma-separated values (dec or 0x hex) -> list of 8 ints."""
     parts = [part.strip() for part in str(text).split(",") if part.strip()]
-    if len(parts) == 1:
-        return [int(parts[0], 0)] * 8
     if len(parts) != 8:
-        raise ValueError("password: give 1 value (repeated 8x) or 8 comma-separated")
+        raise ValueError("password: give exactly 8 comma-separated words, got %d"
+                         % len(parts))
     return [int(part, 0) for part in parts]
 
 

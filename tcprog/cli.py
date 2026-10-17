@@ -29,7 +29,6 @@ EPILOG = r"""examples:
   tcprog ucb -c tc375 -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8
   tcprog write -c tc375 -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8 app.elf
   tcprog read -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8 --addr 0x80000000 --length 0x6c00 -o flash.bin
-  tcprog read -t asc-bsl --asc-bsl-port /dev/ttyUSB0 --addr 0x80000000 --length 0x6c00 --asc-bsl-compress -o flash.bin
   tcprog write --dry-run -c tc375 app.srec
 
 exit codes:
@@ -161,8 +160,8 @@ def _add_conn_args(p):
 
     s = p.add_argument_group("security (TC3xx/TC4xx protection - run ident first)")
     s.add_argument("--debug-unlock-pw", default=os.environ.get("TCPROG_DEBUG_UNLOCK_PW"),
-                   help="256-bit debug/JTAG password: 8 words w0,..,w7 (dec/0x-hex), or "
-                        "one value repeated 8x. Env: TCPROG_DEBUG_UNLOCK_PW")
+                   help="256-bit debug/JTAG password: 8 comma-separated words w0,..,w7 "
+                        "(dec/0x-hex). Env: TCPROG_DEBUG_UNLOCK_PW")
     s.add_argument("--unlock-tries", type=int, default=3,
                    help="max debug unlock attempts [default: 3]")
     s.add_argument("--pflash-unlock-pw", nargs="?", const="",
@@ -236,7 +235,7 @@ def _add_write_args(p):
     s.add_argument("--allow-erase-all", action="store_true", help="required for a full-chip erase")
     s.add_argument("--enable-ucb-write", action="store_true",
                    help="[EXPERIMENTAL] required to write a UCB region; IRREVERSIBLE, can brick")
-    s.add_argument("--yes", action="store_true", help="do not prompt for confirmation")
+    s.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
     s.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     s.add_argument("--log-file", help="append a full debug log here")
     return p
@@ -299,7 +298,7 @@ def _build_parser():
     ge.add_argument("--region", choices=("pflash",), help="erase a whole region")
     ge.add_argument("--allow-erase-all", action="store_true",
                     help="required to erase a whole region")
-    ge.add_argument("--yes", action="store_true", help="do not prompt for confirmation")
+    ge.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
     pe.set_defaults(func=_cmd_erase)
 
     pbc = sub.add_parser("blankcheck", help="map programmed vs erased flash with the "
@@ -440,8 +439,8 @@ def _debug_unlock(dap, args, chip=None):
     if not _locked(chipid):
         return addr, chipid
     if chip is not None and chip.family == "tc4xx":
-        raise Fail("locked; TC4xx debug unlock is not supported (its authentication "
-                   "differs from the TC2xx/TC3xx key exchange)", os.EX_NOPERM,
+        raise Fail("locked; TC4xx debug unlock is not implemented yet (same key "
+                   "exchange as TC3xx, untested on a locked part)", os.EX_NOPERM,
                    locked=not args.debug_unlock_pw)
     if not args.debug_unlock_pw:
         raise Fail("locked (DBGIFLCK); pass --debug-unlock-pw to unlock",
@@ -867,14 +866,28 @@ def _cmd_write(args):
                      % ", ".join("0x%08X" % s.addr for s in ucb_segments), EX_REFUSED)
 
     # Confirm before touching flash (destructive, irreversible).
-    span_lo, span_hi = image.span
     if not args.yes:
-        sys.stderr.write("tcprog: about to %sprogram %d bytes to %s at 0x%08X..0x%08X.\n"
-                         "  This ERASES and rewrites flash and cannot be undone.\n"
-                         % ("erase + " if args.erase == "sectors" else "",
-                            image.total_bytes, chip.name, span_lo, span_hi))
+        span_lo, span_hi = image.span
+        fam = chip.family if chip.family == "tc4xx" else "tc3xx"
+        p = profile_for_family(fam)
+        sectors = set()
+        for seg in image.segments:
+            size = _sector_size(seg.addr, p)
+            if size:
+                first, count = _flash_sectors(seg.addr, len(seg.data), size)
+                sectors.update(first + k * size for k in range(count))
+        lines = ["tcprog: write to %s" % chip.name,
+                 "  range     0x%08X..0x%08X  %d B in %d segment(s)"
+                 % (span_lo, span_hi, image.total_bytes, len(image.segments)),
+                 "  regions   %s" % _regions_label(chip, image.segments),
+                 "  erase     %s" % ("%d sector(s) first" % len(sectors)
+                                     if args.erase == "sectors" else "none"),
+                 "  WARNING   flash is erased and rewritten; this cannot be undone"]
+        if any(chip.region_of(seg.addr) == "ucb" for seg in image.segments):
+            lines.append("  WARNING   UCB write: applies at the next reset; check `tcprog ucb` first")
+        sys.stderr.write("\n".join(lines) + "\n")
         try:
-            if input("  continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
                 return _error("aborted", EX_REFUSED)
         except EOFError:
             return _error("aborted (no tty for confirmation; pass --yes)", EX_REFUSED)
@@ -929,10 +942,12 @@ def _cmd_erase(args):
     first, count = _flash_sectors(addr, length, sector)
     end = first + count * sector
     if not args.yes:
-        sys.stderr.write("tcprog: about to ERASE %d sector(s), 0x%08X..0x%08X on %s.\n"
-                         "  This cannot be undone.\n" % (count, first, end, chip.name))
+        sys.stderr.write("tcprog: erase on %s\n"
+                         "  range     0x%08X..0x%08X  %d sector(s)\n"
+                         "  WARNING   the contents are erased; this cannot be undone\n"
+                         % (chip.name, first, end, count))
         try:
-            if input("  continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
                 return _error("aborted", EX_REFUSED)
         except EOFError:
             return _error("aborted (no tty for confirmation; pass --yes)", EX_REFUSED)
@@ -1056,6 +1071,37 @@ def _cmd_blankcheck(args):
                              % (len(prog), len(sectors), prog_bytes // 1024,
                                 addr, addr + length))
     return os.EX_OK
+
+
+# Names of the UCBs most often written, by UCB index (TC3xx: 512 B UCBs from
+# 0xAF400000; TC4xx UCB0/UCB1: 2 KiB UCBs from 0xAE400000 / 0xAEC00000).
+_UCB_NAMES_TC3 = {0: "BMHD0_ORIG", 1: "BMHD1_ORIG", 2: "BMHD2_ORIG", 3: "BMHD3_ORIG",
+                  8: "BMHD0_COPY", 9: "BMHD1_COPY", 10: "BMHD2_COPY", 11: "BMHD3_COPY",
+                  16: "PFLASH_ORIG", 17: "DFLASH_ORIG", 18: "DBG_ORIG",
+                  24: "PFLASH_COPY", 25: "DFLASH_COPY", 26: "DBG_COPY"}
+_UCB_NAMES_TC4 = {(0, 9): "RTC_BMHD0", (0, 10): "RTC_BMHD1", (0, 11): "RTC_BMHD2",
+                  (0, 12): "RTC_BMHD3", (0, 21): "RTC_FLASH_ORIG", (0, 22): "RTC_FLASH_COPY",
+                  (1, 1): "DBGCS_ORIG", (1, 2): "DBGCS_COPY"}
+
+
+def _ucb_name(chip, addr):
+    if chip.family == "tc4xx":
+        block = 0 if addr < 0xAEC00000 else 1
+        index = (addr - (0xAE400000, 0xAEC00000)[block]) // 0x800
+        return "UCB_" + _UCB_NAMES_TC4.get((block, index), "UCB%d_%02d" % (block, index))
+    index = (addr - 0xAF400000) // 0x200
+    return "UCB_" + _UCB_NAMES_TC3.get(index, "%d" % index)
+
+
+def _regions_label(chip, segments):
+    """Comma list of the regions the segments touch, naming UCBs individually."""
+    names = []
+    for seg in segments:
+        region = chip.region_of(seg.addr)
+        name = _ucb_name(chip, seg.addr) if region == "ucb" else region
+        if name not in names:
+            names.append(name)
+    return ", ".join(names)
 
 
 def _dry_run_plan(image, args, chip):
