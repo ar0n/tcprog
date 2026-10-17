@@ -218,7 +218,9 @@ def _add_write_args(p):
     r.add_argument("--before", choices=("default-reset", "no-reset", "porst"),
                    default="default-reset", help="reset action before [default: default-reset]")
     r.add_argument("--after", choices=("reset", "no-reset", "halt"), default="reset",
-                   help="reset action after [default: reset]")
+                   help="after a TC3xx PFLASH write/erase (CPU0 is halted at reset for "
+                        "it): reset restarts the application, no-reset/halt leave "
+                        "CPU0 halted [default: reset]")
 
     s = p.add_argument_group("safety")
     s.add_argument("-n", "--dry-run", action="store_true", help="parse and plan, touch nothing")
@@ -344,13 +346,48 @@ def _read_identity(dap, chip=None):
     return SCU_CHIPID, None
 
 
-def _unlock_if_locked(dap, args, chip=None):
+def _unlock_if_locked(dap, args, chip=None, halt=False):
     """Read the identity register; if the part is debug-locked, unlock with
-    --debug-unlock-pw; then disable flash protection if asked. -> (id_addr,
-    id_value). Raises Fail (locked=True when no password was given)."""
+    --debug-unlock-pw; optionally halt CPU0 at reset (halt=True); then disable
+    flash protection if asked. -> (id_addr, id_value). Raises Fail (locked=True
+    when no password was given)."""
+    was_locked = _locked(_read_identity(dap, chip)[1])
     addr, chipid = _debug_unlock(dap, args, chip)
+    if halt:
+        _halt_cpu(dap, chip, was_locked)
     _disable_flash_protection(dap, args, chip)
     return addr, chipid
+
+
+def _halt_cpu(dap, chip, was_locked):
+    """TC3xx: PFLASH program/erase is refused (PROER) once the application has
+    started (e.g. it sets Safety ENDINIT), so reset with Halt-After-Reset and
+    keep CPU0 at its first instruction during the flash operation."""
+    if was_locked:
+        log("tcprog: warning - not halting CPU0: the part was debug-locked and a "
+            "halt-after-reset would lock it again; PFLASH program/erase may be "
+            "refused while the application runs")
+        return
+    pc = dap.halt_after_reset()
+    if pc is None:
+        log("tcprog: warning - could not halt CPU0 at reset; PFLASH program/erase "
+            "may be refused while the application runs")
+    else:
+        log("tcprog: CPU0 halted at reset (PC 0x%08X)" % pc, verbose=True)
+    return pc
+
+
+def _after(dap, args, halted):
+    """--after: reset (default) restarts the application; no-reset / halt leave
+    CPU0 halted."""
+    if halted and getattr(args, "after", "reset") == "reset":
+        try:
+            dap.pulse_reset(0.010, 0.0)
+        except DapError as error:
+            log("tcprog: warning - could not reset the target afterwards (%s); "
+                "CPU0 may still be halted, reset or power-cycle it" % error)
+            return
+        log("tcprog: reset, application restarted", verbose=True)
 
 
 def _disable_flash_protection(dap, args, chip):
@@ -827,8 +864,9 @@ def _cmd_write(args):
     except Fail as f:
         return _error(f, f.code)
     with dap:
+        halt = chip.family == "tc3xx" and any(_is_pflash(seg.addr) for seg in image.segments)
         try:
-            _unlock_if_locked(dap, args, chip)
+            _unlock_if_locked(dap, args, chip, halt=halt)
         except Fail as f:
             return _error(f, f.code)
         try:
@@ -836,6 +874,8 @@ def _cmd_write(args):
             return _program(dap, image, args, family=fam)
         except DapError as error:
             return _error("flash operation failed: %s" % error, os.EX_IOERR)
+        finally:
+            _after(dap, args, halt)
 
 
 def _cmd_erase(args):
@@ -879,8 +919,9 @@ def _cmd_erase(args):
     except Fail as f:
         return _error(f, f.code)
     with dap:
+        halt = chip.family == "tc3xx" and _is_pflash(first)
         try:
-            _unlock_if_locked(dap, args, chip)
+            _unlock_if_locked(dap, args, chip, halt=halt)
         except Fail as f:
             return _error(f, f.code)
         try:
@@ -892,6 +933,8 @@ def _cmd_erase(args):
             flash.reset_to_read()
         except DapError as error:
             return _error("erase failed: %s" % error, os.EX_IOERR)
+        finally:
+            _after(dap, args, halt)
     if not args.quiet:
         log("tcprog: erased %d sector(s) (0x%08X..0x%08X)" % (count, first, end))
     return os.EX_OK

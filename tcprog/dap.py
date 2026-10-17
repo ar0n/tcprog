@@ -110,6 +110,7 @@ IOINFO_DIALOGUE = 0x00380080          # startup software listening for the key
 _DAPISC16 = _telegram(CMD_DAPISC, 0x0F00, 16)
 _DAPISC48 = _telegram(CMD_DAPISC, 0x4ABBAF530400, 48)
 _OJCONF_503 = _telegram(CMD_WRITEREG, 0x503E, 20)
+_OJCONF_HARR = _telegram(CMD_WRITEREG, 0x1303E, 20)   # halt-after-reset request
 _SEL = _telegram(CMD_SET_IO_CLIENT, 1, 3)
 _POLL = _telegram(CMD_READREG, 0x4B, 7)   # IOINFO
 
@@ -311,6 +312,25 @@ class Dap:
         self._batched([(_SEL, 3), (_POLL, 9)])
         chipid = self.try_read_word(0xF0036140)
         return (chipid not in (None, 0, 0xFFFFFFFF)), chipid
+
+    CPU0_PC = 0xF881FE08                    # TC3xx/TC4xx CPU0 core register PC
+
+    def halt_after_reset(self, tries=3):
+        """Reset with a Halt-After-Reset request, so the startup software stops
+        CPU0 at the first user-code instruction before the application runs.
+        -> the halted PC, or None if CPU0 did not stay halted. Needs an open debug
+        interface after the reset."""
+        import time
+        for _ in range(tries):
+            self.pulse_reset(0.010, 0.0)
+            self._batched([(_DAPISC16, 5), (_DAPISC48, 5), (_SEL, 3), (_POLL, 9),
+                           (_OJCONF_HARR, 7), (_POLL, 9)])
+            time.sleep(0.2)
+            self.connect()
+            first = self.read_word_retry(self.CPU0_PC)
+            if first is not None and first == self.read_word_retry(self.CPU0_PC):
+                return first
+        return None
 
     def unlock(self, words, tries=3, settle=0.0, on_attempt=None):
         """Retry the key exchange until it unlocks. -> (unlocked, chipid, tries).
