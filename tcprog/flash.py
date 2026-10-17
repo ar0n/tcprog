@@ -13,7 +13,7 @@ import sys
 from .dap import Dap, DapError
 from .image import (parse_bmhd_tc2, parse_bmhd_tc3, parse_bmhd_tc4,
                     validate_bmhd_tc2, validate_bmhd_tc3, validate_bmhd_tc4)
-from .util import EX_VERIFY, Fail, _error, log
+from .util import EX_VERIFY, Fail, Progress, _error, log
 
 FSI_BASE = 0xAF000000               # TC3xx command base (back-compat default)
 
@@ -595,6 +595,9 @@ def _program(dap, image, args, family="tc3xx"):
             log("tcprog: erase %d sector(s) from 0x%08X" % (count, first), verbose=True)
             flash.erase_range(first, count, sector)
 
+    done = 0
+    programming = Progress("programmed", image.total_bytes, " bytes",
+                           not args.quiet and not getattr(args, "no_progress", False))
     for segment in image.segments:
         page = DFLASH_PAGE if _is_dflash(segment.addr, flash.p) else PFLASH_PAGE
         data, base = segment.data, segment.addr & ~(page - 1)
@@ -604,11 +607,9 @@ def _program(dap, image, args, family="tc3xx"):
             buf += b"\xFF" * (page - len(buf) % page)
         for off in range(0, len(buf), page):
             flash.program_page(base + off, buf[off:off + page])
-        if not args.quiet:
-            sys.stderr.write("\r  programmed %d/%d bytes" % (segment.end - segment.addr,
-                                                             image.total_bytes))
-    if not args.quiet:
-        sys.stderr.write("\n")
+            programming.update(done + max(0, min(off + page - pad_front, len(data))))
+        done += len(data)
+    programming.finish()
     flash.reset_to_read()
 
     if not args.no_verify:

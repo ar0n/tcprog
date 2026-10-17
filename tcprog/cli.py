@@ -18,7 +18,7 @@ from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _flash_secto
                     _sector_size, blank_map, bmhd_blocks, profile_for_family,
                     next_boot_report, read_region_blankcheck, read_region_sparse, read_words)
 from .image import load_image, _emit, _hexdump, _out_format
-from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, _error, log, set_verbose
+from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, Progress, _error, log, set_verbose
 
 DESCRIPTION = "AURIX TC2xx/TC3xx/TC4xx flash programmer over an FTDI-MPSSE DAP or ASC BSL."
 
@@ -698,11 +698,11 @@ def _cmd_read(args):
             total_kib = (((addr + length + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1))
                          - (addr & ~(Dap.BLOCK - 1))) // 1024
 
+            show = not args.quiet and not args.no_progress
+            scan = Progress("scan", total_kib, " KiB", show)
+
             def progress(done, total, kept):
-                if not args.quiet and not args.no_progress:
-                    sys.stderr.write("\r  scan %d/%d KiB  kept %d KiB"
-                                     % (done, total, kept // 1024))
-                    sys.stderr.flush()
+                scan.update(done, "  kept %d KiB" % (kept // 1024))
 
             # On TC3xx/TC4 PFLASH, map occupancy with the hardware blank-check and
             # read only the programmed sectors - the erased bulk is never read,
@@ -713,21 +713,25 @@ def _cmd_read(args):
             started = time.time()
             try:
                 if use_bc:
+                    mapping = []
+
                     def on_map(done, total):
-                        if not args.quiet and not args.no_progress:
-                            sys.stderr.write("\r  blank-check %d/%d sectors" % (done, total))
-                            sys.stderr.flush()
+                        if not mapping:
+                            mapping.append(Progress("blank-check", total, " sectors", show))
+                        mapping[0].update(done)
                     segments, missed, unreadable = read_region_blankcheck(
                         dap, addr, length, on_map=on_map, family=chip.family)
+                    if mapping:
+                        mapping[0].finish()
                 else:
                     segments, missed = read_region_sparse(
                         dap, addr, length, on_progress=progress)
                     unreadable = []
             except DapError as error:
-                sys.stderr.write("\ntcprog: sparse read failed: %s\n" % error)
+                scan.finish()
+                sys.stderr.write("tcprog: sparse read failed: %s\n" % error)
                 return os.EX_IOERR
-            if not args.quiet and not args.no_progress:
-                sys.stderr.write("\n")
+            scan.finish()
             elapsed = time.time() - started
             data_len = sum(len(d) for _, d in segments)
         else:
@@ -737,21 +741,18 @@ def _cmd_read(args):
             block_addrs = list(range(start, end, block_size))
             buffer, group_size = bytearray(), 16
             started = time.time()
+            reading = Progress("read", (end - start) // 1024, " KiB",
+                               not args.quiet and not args.no_progress)
             try:
                 for index in range(0, len(block_addrs), group_size):
                     buffer += dap.read_blocks(block_addrs[index:index + group_size])
-                    if not args.quiet and not args.no_progress:
-                        sys.stderr.write("\r  read %d/%d KiB"
-                                         % (len(buffer) // 1024, (end - start) // 1024))
-                        sys.stderr.flush()
+                    reading.update(len(buffer) // 1024)
             except DapError as error:
-                if not args.quiet and not args.no_progress:
-                    sys.stderr.write("\n")
+                reading.finish()
                 sys.stderr.write("tcprog: read failed near 0x%08X: %s\n"
                                  % (start + len(buffer), error))
                 return os.EX_IOERR
-            if not args.quiet and not args.no_progress:
-                sys.stderr.write("\n")
+            reading.finish()
             elapsed = time.time() - started
             data = bytes(buffer[addr - start: addr - start + length])
 
@@ -1015,20 +1016,19 @@ def _cmd_blankcheck(args):
             return _error("refusing to blank-check: cannot confirm the connected part "
                           "(chipid 0x%08X unrecognised)" % (chipid or 0), EX_REFUSED)
 
+        checking = Progress("blank-check", _pflash_sectors(addr, length)[1], " sectors",
+                            not args.quiet and not args.no_progress)
+
         def progress(done, total, sa, blank):
-            if not args.quiet and not args.no_progress:
-                sys.stderr.write("\r  blank-check %d/%d sectors" % (done, total))
-                sys.stderr.flush()
+            checking.update(done)
 
         try:
             sectors = blank_map(dap, addr, length, on_progress=progress,
                                 family=chip.family)
         except DapError as error:
-            if not args.quiet and not args.no_progress:
-                sys.stderr.write("\n")
+            checking.finish()
             return _error("blankcheck failed: %s" % error, os.EX_IOERR)
-        if not args.quiet and not args.no_progress:
-            sys.stderr.write("\n")
+        checking.finish()
 
     # merge contiguous programmed sectors into ranges
     prog = [sa for sa, blank in sectors if not blank]

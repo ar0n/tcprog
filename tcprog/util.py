@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Aron Szabo <aron@aron.ws>
-"""Exit codes, logging, and the Fail exception shared across tcprog."""
+"""Exit codes, logging, progress output, and the Fail exception shared across tcprog."""
 import sys
+import time
 
 # Exit codes: the standard sysexits.h values via os.EX_* (EX_OK=0, EX_USAGE=64
 # bad args, EX_DATAERR=65 bad image, EX_UNAVAILABLE=69 no probe/target/binding,
@@ -42,3 +43,42 @@ class Fail(Exception):
         super().__init__(msg)
         self.code = code
         self.locked = locked
+
+
+class Progress:
+    """Progress of a long operation on stderr. On a terminal it is one line
+    updated in place; otherwise (CI logs, pipes, files) it prints a plain line at
+    most every 10 % (plus a heartbeat every `interval` seconds on slow steps), so
+    logs stay short and readable.
+    Disabled entirely with enabled=False (--no-progress / --quiet)."""
+
+    def __init__(self, label, total, unit="", enabled=True, interval=30.0):
+        self.label, self.total, self.unit = label, max(total, 1), unit
+        self.enabled = enabled
+        self.tty = enabled and sys.stderr.isatty()
+        self.interval = interval
+        self._last_time = time.monotonic()
+        self._last_step = -1
+        self._shown = False
+
+    def update(self, done, extra=""):
+        if not self.enabled:
+            return
+        pct = min(100, int(done * 100 / self.total))
+        text = "  %s %d/%d%s (%d%%)%s" % (self.label, done, self.total, self.unit, pct, extra)
+        if self.tty:
+            sys.stderr.write("\r" + text)
+            sys.stderr.flush()
+            self._shown = True
+            return
+        now = time.monotonic()
+        if pct // 10 > self._last_step or now - self._last_time >= self.interval:
+            sys.stderr.write(text + "\n")
+            sys.stderr.flush()
+            self._last_step, self._last_time = pct // 10, now
+
+    def finish(self):
+        """End the in-place line on a terminal (plain lines need nothing)."""
+        if self.tty and self._shown:
+            sys.stderr.write("\n")
+            self._shown = False
