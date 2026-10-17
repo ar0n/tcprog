@@ -7,65 +7,207 @@ miniWiggler / on-board debugger, or any FTDI-based programmer. Gets firmware
 on/off the part and reports the target honestly, across three AURIX generations
 (TC2xx / 1G, TC3xx / 2G and TC4xx / 3G). It is **not** a debugger or emulator.
 
-The DAP protocol - the telegram layout - was reverse-engineered from captured
-miniWiggler USB traffic; the IOClient response framing follows Infineon's public
-C166S On-Chip Debug Support user manual (V1.1, 2001).
+## Install
 
-A Python package. Run it from a source checkout with `python -m tcprog` (or the
-`./tcprog-cli` launcher), or `pip install .` for a `tcprog` command:
+Python 3.8 or newer. A Python package: run it from a source checkout with
+`python -m tcprog` (or the `./tcprog-cli` launcher), or `pip install .` for a
+`tcprog` command.
 
-    python -m tcprog --help
-    python -m tcprog list probes         # attached FTDI/DAP probes
-    python -m tcprog list chips          # supported parts for --chip
-    python -m tcprog ident -p 058b:0043:MWAJFJ9N
-    python -m tcprog write --dry-run -c tc375 app.srec
+- **bincopy** (required) parses firmware images.
+- **ftdi1**, the libftdi1 Python binding, is needed for the DAP transport
+  (`pip install .[dap]`, or your distribution's libftdi1 Python package).
+  `list`, `chips` and `--dry-run` work without it.
+- The user needs access to the probe's USB device (`058b:0043` for Infineon DAS
+  probes), for example through a udev rule.
 
-## Layout
+```
+python -m tcprog --help
+python -m tcprog list probes         # attached FTDI/DAP probes
+python -m tcprog list chips          # supported parts for --chip
+python -m tcprog ident -p 058b:0043:<serial>
+python -m tcprog write --dry-run -c tc375 app.srec
+python -m tcprog write -c tc375 -p 058b:0043:<serial> app.srec
+```
 
-    pyproject.toml        packaging (console_script `tcprog`, package-data devices)
-    tcprog-cli            run from a checkout without installing
-    tcprog/               the package
-      cli.py              argparse subcommands + main
-      dap.py              FTDI-MPSSE DAP transport (Dap, unlock, read/write)
-      flash.py            FSI flash driver (erase/program/verify) + UCB reads
-      chips.py            device DB (Chip, lookup/detect)
-      image.py            firmware image parse/emit + BMHD
-      util.py             exit codes, logging, Fail
-      devices/*.json      device database (memory map + registers, one per part)
-    tools/harvest_illd.py generator for devices/ (harvests Infineon iLLD)
-    LICENSE               MIT
+## Commands
 
-## Image formats
+Every command except `list` accepts the [common options](#common-options).
+Progress goes to stderr: on a terminal as one line updated in place, otherwise
+(CI logs, pipes) as a plain line every 10 %, so logs stay short; `--no-progress`
+or `-q` turn it off.
 
-Parsing is delegated to **bincopy** (`pip install bincopy`), a required
-dependency. The text formats (SREC, Intel HEX, TI-TXT) are auto-detected by
-content; ELF and raw `.bin` (the latter needs `--address`) are dispatched by
-extension / magic.
+### list
 
-## Device database
+Lists attached FTDI/DAP probes, or the parts `--chip` accepts.
 
-Each part is a JSON file in `tcprog/devices/` - the memory map as an explicit **list of
-slices** (the AURIX map has gaps: PFLASH, hole, DFLASH0, hole, UCB, hole, CFS,
-DF1/HSM), plus protection registers and the ASCLIN/WDT SFRs the ASC-BSL payload
-needs. `--chip` selects one (by name or a part-number alias, e.g. `tc397`,
-`tc275`); `ident` can detect it from `SCU_CHIPID` (TC2xx/TC3xx) or `CBS_JTAGID`
-(TC4xx). The whole DB is regenerated
-from Infineon iLLD by `tools/harvest_illd.py --illd-root <path>/resources`.
+| Option | Meaning |
+|---|---|
+| `probes` | attached FTDI/DAP probes |
+| `chips` | supported parts for `--chip` |
 
-Coverage (production parts): TC2xx `tc22x/tc23x/tc26x/tc27x/tc29x`; TC3xx
-`tc33x/tc35x/tc36x/tc37x(=tc375)/tc38x/tc39x`; TC4xx `tc4dx` (`ident`, `read`,
-`ucb` (BMHD blocks), `blankcheck`, `write` and `erase`; debug unlock refuses it,
-see [TC4xx](#tc4xx)).
-TC2xx (1G) differs from 2G in the watchdog SFRs, the flash-protection module
-(FLASH0 vs the DMU), and the UCB layout - captured per-part in the JSON.
+### ident
+
+Reads the identity register and reports the part: chip name (matched in the
+device database), step, HSM flag and PFLASH/DFLASH sizes. TC2xx and TC3xx use
+`SCU_CHIPID` (its CHTEC field tells the generations apart); TC4xx has no
+`SCU_CHIPID`, so it reads `CBS_JTAGID` (`0xFA180080`) and reports the JTAG part
+number and version instead of the HSM flag. It reports identity only, not
+protection state.
+
+| Option | Meaning |
+|---|---|
+| `--check NAME` | exit 80 unless the detected chip matches `NAME` |
+| `--fields LIST` | comma-separated subset of fields to print |
+
+### read
+
+Dumps a range or a whole region to a file (bin/srec/hex) or as a hexdump. Reads
+are 1 KiB blocks batched over one USB transfer. Reading erased PFLASH raises an
+ECC error and can wedge the target, so it warns when a range falls outside a
+known memory slice. `--skip-erased` reads a mostly erased device and keeps only
+what answers; on TC3xx/TC4xx PFLASH it maps the range with `blankcheck` first and
+reads only the programmed sectors (a whole TC4D7 in 18 s instead of 10 min).
+
+| Option | Meaning |
+|---|---|
+| `--addr`, `--length` | range to read |
+| `--region NAME` | read a whole region (needs `-c`) |
+| `-o`, `--output FILE` | output file (bin/srec/hex by extension); omit to hexdump |
+| `--format FMT` | override the output format |
+| `--skip-erased`, `--sparse` | keep only what answers and emit a sparse image (srec/hex) |
+| `--no-progress` | no progress output |
+
+### ucb
+
+Reads the User Configuration Blocks: each UCB's confirmation state (CONFIRMED /
+UNLOCKED / ERASED, which counts as errored) and the boot mode header (BMHD)
+contents and CRC. `verify` exits 81 if a confirmation word is unrecognized or a
+BMHD is invalid; `export` dumps the raw BMHD blocks. On TC3xx it also prints a
+**Next boot** check (see [Protection](#protection-and-unlocking)).
+
+| Option | Meaning |
+|---|---|
+| `decode` / `verify` / `export` | action (default `decode`) |
+| `-o`, `--output FILE` | `export`: output file |
+| `--format FMT` | `export`: output format (default: from the `-o` extension) |
+
+### write
+
+Programs an image (requires `-c/--chip`): erases the covered sectors (PFLASH and
+DFLASH), programs page by page, then verifies by reading back. It runs the
+memory-map allowlist and the UCB gate, shows the range, regions (UCBs by name)
+and sector count, and asks before touching flash.
+
+On TC3xx a running application can make PFLASH program/erase fail (the startup
+code locks it, e.g. via Safety ENDINIT). For PFLASH, `write` and `erase` therefore
+reset the part with a halt-after-reset request, keep CPU0 at its first
+instruction during the operation, and reset again afterwards so the application
+restarts.
+
+| Option | Meaning |
+|---|---|
+| `FIRMWARE` | image to write (`.elf` / `.hex` / `.srec` / `.bin`) |
+| `-a`, `--address ADDR` | load address for a raw `.bin` |
+| `--format FMT` | override the image format |
+| `--erase sectors\|none` | erase the covered sectors first (default `sectors`) |
+| `--no-verify` | skip read-back verification |
+| `--after reset\|no-reset\|halt` | after a TC3xx PFLASH write: restart the application (default) or leave CPU0 halted |
+| `-n`, `--dry-run` | parse and plan, touch nothing |
+| `--enable-ucb-write` | required to write a UCB region |
+| `--allow-erase-all` | required for a full-chip erase |
+| `-y`, `--yes` | answer yes to the confirmation prompt |
+| `--no-progress` | no progress output |
+
+### erase
+
+Erases the logical sectors covering a range (requires `-c/--chip`): PFLASH
+16 KiB; DFLASH 4 KiB on TC3xx, 2 KiB on TC4xx; one UCB at a time in a UCB region.
+Ranges are split so that one flash command never exceeds the controller's limits
+(512 KB PFLASH / 256 KB DFLASH, inside one bank), and every command's error flags
+are checked, so a rejected erase fails with an error instead of reporting
+success. Asks before erasing.
+
+| Option | Meaning |
+|---|---|
+| `--addr`, `--length` | range to erase, rounded out to whole sectors |
+| `--region NAME` | erase a whole region (needs `--allow-erase-all`) |
+| `--allow-erase-all` | required to erase a whole region |
+| `-y`, `--yes` | answer yes to the confirmation prompt |
+
+### blankcheck
+
+Maps which PFLASH sectors are programmed with the flash controller's
+Verify-Erased command (TC3xx and TC4xx): no array reads, so no ECC traps.
+
+| Option | Meaning |
+|---|---|
+| `--addr`, `--length` | range to check, rounded out to whole sectors |
+| `--region NAME` | check a whole region |
+| `--no-progress` | no progress output |
+
+### Common options
+
+Accepted by `ident`, `read`, `ucb`, `write`, `erase` and `blankcheck`:
+
+| Option | Meaning | Default / env |
+|---|---|---|
+| `-c`, `--chip NAME` | target part or family (e.g. `tc375`, `tc37x`, `tc2xx`); optional where `ident` can detect it | `TCPROG_CHIP` |
+| `--device FILE` | custom device JSON instead of a built-in part; its memory slices act as the write allowlist | |
+| `-p`, `--probe ID` | FTDI probe as `VID:PID` or `VID:PID:SERIAL` | `TCPROG_PROBE` |
+| `--speed KHZ` | DAP clock in kHz | 1000 |
+| `--connect-under-reset` | reset the target while attaching; without it the target keeps running | off |
+| `-t`, `--transport` | `dap` or `asc-bsl` (`asc-bsl` not implemented yet) | `dap` |
+| `--asc-bsl-port`, `--asc-bsl-baud` | serial port and baud for `asc-bsl` (not implemented yet) | 115200 |
+| `--debug-unlock-pw PW` | 256-bit debug password: 8 comma-separated words `w0,...,w7` (dec or `0x` hex) | `TCPROG_DEBUG_UNLOCK_PW` |
+| `--unlock-tries N` | max debug unlock attempts | 3 |
+| `--pflash-unlock-pw [PW]` | lift PFLASH protection; without a value the debug password is reused | `TCPROG_PFLASH_UNLOCK_PW` |
+| `--dflash-unlock-pw [PW]` | lift DFLASH protection; without a value the debug password is reused | `TCPROG_DFLASH_UNLOCK_PW` |
+| `-q`, `--quiet` | only print errors | |
+| `-v`, `--verbose` | more detail (repeatable) | |
+| `--json` | machine-readable result on stdout (`ident`, `read`, `ucb`, `blankcheck`, `write --dry-run`) | |
+
+Accepted but not implemented yet: `write --region`, `--preserve`, `--before`,
+`--timeout` and `--log-file`; `--asc-bsl-compress`; and the `unlock` command.
+
+## Protection and unlocking
+
+- `--debug-unlock-pw` opens a debug-locked TC2xx/TC3xx part with the 256-bit
+  debug password (Cerberus key exchange at startup). It takes exactly 8
+  comma-separated words (e.g. `1,2,3,4,5,6,7,8` or `0x00000000,0x11111111,...`)
+  and usually succeeds on the first attempt; it retries up to `--unlock-tries`
+  times (default 3).
+- `--pflash-unlock-pw` / `--dflash-unlock-pw` lift flash protection with the DMU
+  "Disable Protection" command before the operation. Given without a value they
+  reuse the debug password. On TC3xx PFLASH and DFLASH have separate passwords
+  (UCB_PFLASH / UCB_DFLASH); on TC4xx one UCB_RTC_FLASH password lifts the global
+  read and write protection of both. A wrong password is refused, and the DMU
+  then refuses every retry until the next reset.
+- An unlock lasts until the next reset. Attaching leaves the target running, so
+  later commands do not need the password again; `--connect-under-reset` resets
+  the part while attaching.
+- On TC3xx, flash **read** protection (PFLASH or DFLASH) also keeps the debug
+  interface locked at startup, and only a configured debug password (UCB_DBG)
+  opens it again. Set the debug password before enabling read protection, or the
+  part can no longer be reached over DAP. TC4xx does not tie debug access to
+  flash read protection.
+- UCB changes take effect at the next reset. On TC3xx, `tcprog ucb` prints a
+  **Next boot** check that compares what the UCBs will install (PFLASH/DFLASH
+  read protection, DFLASH write protection, the debug lock) with the live DMU
+  registers, lists pending changes, and flags a LOCKOUT (which also fails
+  `ucb verify`) when read protection would come up with no debug password.
+  Run it after changing UCBs and before resetting: a protection written by
+  mistake can still be undone while the part is running.
 
 ## Safety
 
 - `--dry-run` parses and plans, touching nothing.
+- `write` and `erase` show the range, regions (UCBs by name) and sector count and
+  ask before touching flash.
 - `--enable-ucb-write` is required for any write that lands in a UCB region;
-  without it such a write is refused (exit 82). UCB writes are irreversible and
-  can permanently brick the part. BMHD validation (`validate_bmhd`) mirrors the
-  BROM's acceptance check to catch a header that would not boot.
+  without it the write is refused (exit 82). A wrong UCB can lock you out of the
+  part or stop it booting; a CONFIRMED UCB cannot be changed back.
+- BMHD validation mirrors the startup software's acceptance checks, to catch a
+  header that would not boot.
 
 ## Exit codes
 
@@ -74,99 +216,98 @@ TC2xx (1G) differs from 2G in the watchdog SFRs, the flash-protection module
 | 0  | `EX_OK`          | success |
 | 64 | `EX_USAGE`       | bad arguments / missing option |
 | 65 | `EX_DATAERR`     | bad or unreadable image, or bad output format |
-| 69 | `EX_UNAVAILABLE` | no probe/target found, `ftdi1` binding missing, or command not implemented |
+| 69 | `EX_UNAVAILABLE` | no probe/target found, `ftdi1` binding missing, or not supported for this part/transport |
 | 73 | `EX_CANTCREAT`   | cannot write the output file |
-| 74 | `EX_IOERR`       | transfer failed mid-operation (read/write/erase) |
-| 75 | `EX_TEMPFAIL`    | operation timed out (`--timeout`) |
-| 77 | `EX_NOPERM`      | debug-locked (DBGIFLCK) and no / wrong `--debug-unlock-pw` |
+| 74 | `EX_IOERR`       | transfer or flash operation failed |
+| 77 | `EX_NOPERM`      | debug-locked and no / wrong `--debug-unlock-pw`, or a flash-protection password was refused |
 | 80 | `EX_CHECK`       | `ident --check`: detected part != expected |
-| 81 | `EX_VERIFY`      | read-back verification mismatch |
+| 81 | `EX_VERIFY`      | read-back verification mismatch, or `ucb verify` found a problem |
 | 82 | `EX_REFUSED`     | a destructive op refused for safety (e.g. UCB write without `--enable-ucb-write`) |
 
-## Status
+## Device database
 
-`list probes`, `list chips`, image loading, `--dry-run` planning, the UCB-write
-gate, the chip DB and BMHD validation work. `ident` and `read` work over the FTDI-MPSSE
-DAP, including `--debug-unlock-pw` (Cerberus key exchange; the window is
-stochastic, so it retries `--unlock-tries` times, default 10).
+Each part is a JSON file in `tcprog/devices/`: the memory map as an explicit
+**list of slices** (the AURIX map has gaps: PFLASH, hole, DFLASH0, hole, UCB,
+hole, CFS, DF1/HSM), plus protection and watchdog registers. `--chip` selects one
+by name or part-number alias (e.g. `tc397`, `tc275`); `ident` detects it
+otherwise.
 
-- `ident` resolves the part from `SCU_CHIPID` and reports the identity decoded
-  from it: chip name (matched in the device DB), step, HSM flag, and PFLASH/DFLASH
-  sizes. It reports identity only, not protection state. TC4xx has no
-  `SCU_CHIPID`; there it reads `CBS_JTAGID` (`0xFA180080`) and reports the JTAG
-  part number and version instead of the HSM flag (verified on a TC4D7 lite kit,
-  `0x10225083`).
-- `ucb [decode|verify|export]` reads and decodes the User Configuration Blocks:
-  each UCB's confirmation state (CONFIRMED / UNCONFIRMED / ERASED) and the BMHD
-  (boot mode header) contents + CRC. `verify` exits 81 (`EX_VERIFY`) if a UCB
-  confirmation word is unrecognized or a BMHD CRC is bad. `export -o FILE` dumps
-  the raw BMHD blocks (header, password, confirmation) as bin/srec/hex.
-  On TC4xx only the four BMHD blocks are known (`0xAE404800 + n*0x800`, 2 KiB
-  each). Their header differs from TC3xx: `SAL` (the header's own address),
-  BMI, BMHDID, STAD and a CRC-32 over those 12 bytes, with no inverted CRC;
-  password at +0x7D0, confirmation word and its copy at +0x7F0/+0x7F8. The BMI
-  is shown raw, as its TC4xx bit layout is not in the iLLD.
-- `read` dumps `--addr`/`--length` (or a whole `--region` on a known `-c/--chip`)
-  to `-o` as bin/srec/hex (by extension, or `--format`), or hexdumps to stdout.
-  Reads are 1 KiB blocks batched over one USB transfer; output verified
-  byte-identical to the reference `dap_read.py`. Reading erased flash raises an
-  ECC error and can wedge the target, so it warns when a range falls outside a
-  known memory slice.
-- `write` (requires `-c/--chip`) programs an image over DAP: optional sector
-  erase (`--erase sectors`, PFLASH and DFLASH), page program, then read-back verify.
-  It runs the allowlist and UCB gates, then confirms before touching flash
-  (skip with `--yes`). The FSI command sequences are transcribed from Infineon's
-  iLLD `IfxFlash.h`, and the full erase+program+verify path is proven end-to-end
-  on a TC375 (reflashed firmware boots and runs - "Hello World" over ASCLIN0).
-- `erase` (requires `-c/--chip`) erases the logical sectors (PFLASH 16 KiB,
-  DFLASH 4 KiB on TC3xx / 2 KiB on TC4xx) covering `--addr`/`--length`, or a
-  whole `--region pflash` (which needs `--allow-erase-all`); confirms first unless
-  `--yes`. A range is split into commands of at most 512 KB (PFLASH) / 256 KB
-  (DFLASH), each aligned so it stays inside one bank, and every command's error
-  flags are checked, so a rejected erase fails loudly instead of reporting
-  success.
-- `blankcheck` (TC3xx and TC4xx) maps which PFLASH sectors are programmed with
-  the flash controller's Verify-Erased command: no array reads, so no ECC traps.
-  `read --skip-erased` uses it to read only the programmed sectors of a mostly
-  erased device (a whole TC4D7 in 18 s instead of 10 min).
+Coverage: TC2xx `tc22x/tc23x/tc26x/tc27x/tc29x`; TC3xx
+`tc33x/tc35x/tc36x/tc37x(=tc375)/tc38x/tc39x`; TC4xx `tc4dx`. The TC22x and TC23x
+entries assume the TC26x/27x/29x register map.
 
-The `--debug-unlock-pw` takes 8 words (e.g. `1,2,3,4,5,6,7,8` or
-`0x00000000,0x11111111,...`), or one value repeated 8x. `--pflash-unlock-pw` /
-`--dflash-unlock-pw` disable the flash-protection domains, taking that domain's
-password only when it differs from the debug access password.
+## Tested hardware
+
+| Board | MCU | Probe | Tested |
+|---|---|---|---|
+| AURIX TC375 lite Kit (`KIT_A2G_TC375_LITE`) | SAK-TC375TP-96F300W, AA step | miniWiggler V3.1 | `ident`, debug unlock, `read`, `ucb` (incl. next-boot check), `blankcheck`, `erase`, `write` (reflashed firmware boots), UCB rewrite, DFLASH protection unlock |
+| AURIX TC4D7 lite Kit (`KIT_A3G_TC4D7_LITE`) | TC4D7 | miniWiggler V3.1 | `ident`, `read` (incl. `--skip-erased`), `ucb`, `blankcheck`, `erase`, `write`, PFLASH/DFLASH protection unlock |
+
+Other parts in the device database are untested on silicon.
+
+## Not supported yet
+
+- **ASC BSL transport.** `-t asc-bsl` is accepted but not implemented.
+- **TC2xx `write` / `erase`.** TC2xx flash status lives in the FLASH0 module,
+  not the TC3xx/TC4xx DMU; these commands are refused on TC2xx.
+- **TC4xx debug unlock.** A debug-locked TC4xx is refused (see [TC4xx](#tc4xx)).
+- **Halting a debug-locked TC3xx** for PFLASH operations: the halt-after-reset
+  would lock it again, so it is skipped with a warning.
+- **TC3xx DFLASH in complement-sensing mode** (2 KiB sectors); tcprog assumes the
+  default single-ended 4 KiB.
+- **On-board debuggers** of the lite kits: they enumerate as DAP probes, but on
+  the TC375 kit the reset line is wired differently, so the debug unlock's reset
+  does not take effect.
 
 ## TC4xx
 
-Developed on a TC4D7 lite kit (`KIT_A3G_TC4D7_LITE`) over a miniWiggler, and
-checked against the public *AURIX TC4Dx user manual* v1.1 (2025-06-26) and the
-TC4Dx A-step datasheet. What differs from TC3xx:
+Supported on TC4Dx (tested on a TC4D7 lite kit), checked against the public
+AURIX TC4Dx user manual.
 
-- **Identity.** There is no `SCU_CHIPID`; `ident` reads `CBS_JTAGID`
-  (`0xFA180080`, `0x10225083` on the TC4D7). The UM also documents a CHIPID word
-  in UCB0 (`0xAE400008`: product, cores, package, PFLASH size, temperature range),
-  the SAK part number as ASCII at `0xAE40000C..1B`, and a unique chip ID at
-  `0xAE412000`; `ident` does not read these yet.
-- **Memory map.** PFLASH is 20 MB at `0xA0000000` (cached alias `0x80000000`) in
-  twelve 1-2 MB banks; DFLASH0 (EEPROM0) is 1 MB at `0xAE000000`. UCB0 is at
-  `0xAE400000`, UCB1 (the CSRM/secure cluster) at `0xAEC00000`.
-- **Flash commands.** The command sequences match TC3xx, but the interface sits
-  at `0xF8080000` and status/errors are in the DMU `HCI_*` registers
-  (`HCI_STATUS` `0xF8040004`, `HCI_ERR` `0xF8040010`, `HCI_CLRERR` `0xF8040014`).
-  32-bit Load Page always goes to `0x55F4`. Completion is the REQACK/REQDONE
-  handshake rather than per-bank BUSY bits, so tcprog issues Clear Status before
-  every command (the UM's recommended write sequence) and waits for page mode
-  after Enter Page Mode. DFLASH logical sectors are 2 KiB.
-- **BMHD.** The four host-cluster headers are `UCB_RTC_BMHD0..3` at
-  `0xAE404800 + n*0x800`: `SAL` (the header's own address), BMI, BMHDID `B359`,
-  STAD and a CRC-32 over the first 12 bytes, with no inverted CRC. Password at
-  +0x7D0, confirmation word and copy at +0x7F0/+0x7F8. BMI bit 0 must be 1,
-  MODE is bits 3:1 (`111` internal start, `110` ABM, `100` Generic BSL, `011`
-  ASC BSL) and bits 15:4 must be 0; there is no PINDIS bit (Boot Mode Lock is a
-  separate UCB). `ucb` shows the BMI raw for now.
-- **Confirmation codes.** `0x43211234` is called UNLOCKED on TC4xx (UNCONFIRMED
-  on TC3xx), `0x57B5327F` is CONFIRMED, and anything else, including an erased
-  `0x00000000`, counts as ERRORED. Parts ship with the customer UCBs UNLOCKED.
-- **Not supported.** Debug unlock (TC4xx authentication differs from the TC3xx
-  password exchange), the ASC BSL payload, and UCBs other than the BMHDs.
-  Reading erased flash, or any failed read, leaves the TC4D7 ignoring reads
-  until the DAP connect handshake is re-sent; tcprog reconnects on a miss.
+Works:
+
+- `ident` (via `CBS_JTAGID`; TC4xx has no `SCU_CHIPID`)
+- `read`, `--skip-erased`, `blankcheck`
+- `write` / `erase` on PFLASH and DFLASH
+- `ucb` for the four BMHD blocks (`0xAE404800 + n*0x800`)
+- PFLASH/DFLASH protection unlock (`--pflash-unlock-pw`; one UCB_RTC_FLASH
+  password covers both)
+
+Not yet:
+
+- debug unlock (a debug-locked TC4xx is refused)
+- `ucb` beyond the four BMHD blocks; the BMI is shown raw
+- reading the UCB0 CHIPID, part-number and unique-ID words
+- the ASC BSL transport
+- other TC4xx families (no public iLLD or tested boards yet)
+
+## Layout
+
+    pyproject.toml        packaging (console_script `tcprog`, package-data devices)
+    tcprog-cli            run from a checkout without installing
+    tcprog/               the package
+      cli.py              argparse subcommands + main
+      dap.py              FTDI-MPSSE DAP transport (Dap, unlock, read/write)
+      flash.py            flash driver (erase/program/verify), UCB reads, next-boot check
+      chips.py            device database (Chip, lookup/detect)
+      image.py            firmware image parse/emit + BMHD
+      util.py             exit codes, logging, Fail
+      devices/*.json      device database (memory map + registers, one per part)
+    LICENSE               MIT
+
+Image parsing is delegated to bincopy: SREC, Intel HEX and TI-TXT are detected
+by content; ELF and raw `.bin` (which needs `--address`) by extension or magic.
+
+## Sources
+
+tcprog is built from Infineon's public documentation: the AURIX TC2xx, TC3xx
+and TC4Dx user manuals and data sheets, the C166S On-Chip Debug Support user
+manual (V1.1, 2001), and the iLLD driver sources in Infineon's
+[AURIX_code_examples](https://github.com/Infineon/AURIX_code_examples), whose
+file headers permit use under the Boost Software License.
+The DAP transport has no public specification; tcprog implements it from the
+miniWiggler's USB traffic and the Infineon DAP (ifxdap) patches posted to the
+OpenOCD mailing list, with every telegram validated against the captures.
+
+tcprog is not affiliated with or endorsed by Infineon. AURIX, TriCore and
+miniWiggler are trademarks of Infineon Technologies AG.
