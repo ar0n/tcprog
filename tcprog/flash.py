@@ -121,12 +121,16 @@ def profile_for_family(family):
         raise DapError("no flash profile for family %r (blank-check covers "
                        "tc3xx and tc4xx)" % family)
 
-# UCB (User Configuration Block) layout. Block N sits at <ucb_base> + N*stride;
-# its confirmation word is at block + 0x1F0. Block indices are the DMU
-# Disable-Protection selectors (NOTES-fsi): BMHD0 0x00, PFLASH 0x10, DFLASH 0x11,
-# DBG 0x12. TC3xx stride is 512 B; TC2xx is 1 KiB.
+# UCB (User Configuration Block) layout. Block N sits at <ucb_base> + N*stride.
+# TC3xx: 512 B UCBs, confirmation at +0x1F0; indices are the
+# Disable-Protection selectors BMHD0 0x00, PFLASH 0x10, DFLASH 0x11, DBG 0x12.
+# TC2xx: 1 KiB UCBs, confirmation at +0x70 (copy +0x78); UCB0 PFLASH, UCB1
+# DFLASH, UCB5 DBG. The TC2xx BMHDs are not in a UCB but in PFLASH.
 UCB_CONFIRM_OFF = 0x1F0
 UCB_BLOCKS = (("bmhd0", 0x00), ("pflash", 0x10), ("dflash", 0x11), ("dbg", 0x12))
+TC2_UCB_CONFIRM_OFF = 0x70
+TC2_UCB_BLOCKS = (("pflash", 0x00), ("dflash", 0x01), ("dbg", 0x05))
+TC2_BMHD0, TC2_BMHD_SIZE = 0xA0000000, 32
 _CONFIRM = {0x43211234: "UNCONFIRMED", 0x57B5327F: "CONFIRMED", 0x00000000: "ERASED"}
 
 # TC4xx: four 2 KiB BMHD blocks (iLLD Lcf .bmhd_N_org, Ifx_Ssw_Bmhd), each with
@@ -603,6 +607,8 @@ def bmhd_blocks(chip):
     if chip.family == "tc4xx":
         return [("bmhd%d" % n, TC4_BMHD_BASE + n * TC4_BMHD_STRIDE, TC4_BMHD_STRIDE)
                 for n in range(TC4_BMHD_COUNT)]
+    if chip.family == "tc2xx":
+        return [("bmhd0", TC2_BMHD0, TC2_BMHD_SIZE)]
     ucb = chip.first("ucb")
     if ucb is None:
         raise Fail("no UCB region known for this target; pass -c/--chip or --device",
@@ -643,19 +649,20 @@ def _read_ucbs_tc4(dap, chip):
     return out
 
 
-def _read_classic_ucbs(dap, chip, bmhd_nbytes, parse, validate):
+def _read_classic_ucbs(dap, chip, bmhd_nbytes, parse, validate, blocks=UCB_BLOCKS,
+                       confirm_off=UCB_CONFIRM_OFF, bmhd_addr=None):
     """Shared TC2xx/TC3xx UCB read: every known UCB's confirmation word, plus the
-    BMHD0 header. The BMHD block map (UCB_BLOCKS at ucb.base) is the same for both
-    families; only the BMHD format differs (16 B TC3xx, 32 B TC2xx), passed in."""
+    BMHD0 header. On TC3xx BMHD0 is UCB index 0; on TC2xx it is in PFLASH and
+    passed as bmhd_addr. The BMHD format (16 B TC3xx, 32 B TC2xx) is passed in."""
     ucb = chip.first("ucb") if chip else None
     if ucb is None:
         raise Fail("no UCB region known for this target; pass -c/--chip or --device",
                    os.EX_USAGE)
     stride = _ucb_stride(chip.family)
     out = []
-    for name, index in UCB_BLOCKS:
+    for name, index in blocks:
         block = ucb.base + index * stride
-        confirm = dap.try_read_word(block + UCB_CONFIRM_OFF)
+        confirm = dap.try_read_word(block + confirm_off)
         # A confirmed UCB is read-protected, so its confirm word reads back as
         # unreadable (None) rather than a code.
         state = "CONFIRMED (read-protected)" if confirm is None \
@@ -668,12 +675,22 @@ def _read_classic_ucbs(dap, chip, bmhd_nbytes, parse, validate):
             entry["bmhd"] = parse(header)
             entry["bmhd_ok"], entry["bmhd_problems"] = validate(header, chip)
         out.append(entry)
+    if bmhd_addr is not None:
+        header = b"".join((dap.try_read_word(bmhd_addr + off) or 0).to_bytes(4, "little")
+                          for off in range(0, bmhd_nbytes, 4))
+        ok, problems = validate(header, chip)
+        out.insert(0, {"name": "bmhd0", "addr": bmhd_addr, "confirm": None,
+                       "state": "in PFLASH (no confirmation)", "bmhd": parse(header),
+                       "bmhd_ok": ok, "bmhd_problems": problems})
     return out
 
 
 def _read_ucbs_tc2(dap, chip):
-    """TC2xx (AURIX 1G): 32-byte BMHD format (STADBM | BMI|BMHDID | range | CRC)."""
-    return _read_classic_ucbs(dap, chip, 32, parse_bmhd_tc2, validate_bmhd_tc2)
+    """TC2xx (AURIX 1G): UCB0/1/5 confirmation words, and the 32-byte BMHD0 from
+    PFLASH (STADBM | BMI|BMHDID | range | CRC)."""
+    return _read_classic_ucbs(dap, chip, TC2_BMHD_SIZE, parse_bmhd_tc2, validate_bmhd_tc2,
+                              blocks=TC2_UCB_BLOCKS, confirm_off=TC2_UCB_CONFIRM_OFF,
+                              bmhd_addr=TC2_BMHD0)
 
 
 def _read_ucbs_tc3(dap, chip):

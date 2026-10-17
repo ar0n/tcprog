@@ -63,9 +63,17 @@ def _attempt_logger():
 
 
 def _decode_chipid(v):
-    return {"sec": (v >> 31) & 1, "vart": (v >> 28) & 7, "fsize": (v >> 24) & 0xF,
-            "ucode": (v >> 17) & 0x7F, "chid": (v >> 12) & 0xF,
-            "chpk": (v >> 8) & 0xF, "chtec": (v >> 6) & 3, "chrev": v & 0x3F}
+    """SCU_CHIPID. CHTEC (bits 7:6) names the generation: 01 TC2xx, 10 TC3xx.
+    The upper fields differ: TC2xx has SEC at bit 30 and an 8-bit CHID, TC3xx
+    SEC at bit 31 and VART/CHPK."""
+    chtec = (v >> 6) & 3
+    common = {"fsize": (v >> 24) & 0xF, "ucode": (v >> 17) & 0x7F,
+              "chtec": chtec, "chrev": v & 0x3F}
+    if chtec == 1:
+        return dict(common, sec=(v >> 30) & 1, sp=(v >> 28) & 3, eea=(v >> 16) & 1,
+                    chid=(v >> 8) & 0xFF)
+    return dict(common, sec=(v >> 31) & 1, vart=(v >> 28) & 7, eea=(v >> 16) & 1,
+                chid=(v >> 12) & 0xF, chpk=(v >> 8) & 0xF)
 
 
 def _decode_jtagid(v):
@@ -826,6 +834,12 @@ def _cmd_write(args):
     if args.dry_run:
         return _dry_run_plan(image, args, chip)
 
+    # TC2xx flash protection and status live in the FLASH0 module, not the DMU
+    # this driver polls; programming it with the TC3xx profile would fail mid-way.
+    if chip.family == "tc2xx":
+        return _error("write is not supported on TC2xx yet (FLASH0 status registers "
+                      "differ from the TC3xx/TC4xx DMU)", os.EX_UNAVAILABLE)
+
     # ALLOWLIST: every segment must sit inside one of the device's memory slices.
     # A custom --device file with only the permitted slices thus confines a write
     # to those regions and refuses anything else.
@@ -886,6 +900,9 @@ def _cmd_erase(args):
         return _error(error, os.EX_USAGE)
     if chip is None:
         return _error("erase requires the target: pass -c/--chip or --device", os.EX_USAGE)
+    if chip.family == "tc2xx":
+        return _error("erase is not supported on TC2xx yet (FLASH0 status registers "
+                      "differ from the TC3xx/TC4xx DMU)", os.EX_UNAVAILABLE)
 
     addr, length, whole = args.addr, args.length, False
     if args.region:
