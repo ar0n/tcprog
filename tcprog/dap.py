@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Aron Szabo <aron@aron.ws>
-"""DAP transport (FTDI-MPSSE). Protocol ported from the proven dap_read/dap_proto,
-which reverse-engineered the telegram layout, CRC6 and command ids from captured
-miniWiggler USB traffic; the IOClient response framing follows Infineon's public
-C166S On-Chip Debug Support user manual (V1.1, 2001). ftdi1 (libftdi1) is imported
-lazily so list/chips/dry-run need no USB.
+"""DAP transport (FTDI-MPSSE). ftdi1 (libftdi1) is imported lazily so
+list/chips/dry-run need no USB.
 """
 DEFAULT_VID, DEFAULT_PID = 0x058B, 0x0043
 _CMD_W, _CMD_R, _CMD_FLUSH = 0x19, 0x28, 0x87
@@ -71,7 +68,7 @@ def _writemem_word(addr, value):
     """A 4-byte write: the WRITEMEM header telegram + its 40-bit payload telegram.
 
     Bit 0 of the low byte is clear (that is what makes it a write). Payload is
-    `01` + 32 data bits LSB-first + six zero bits. From dap_proto.writemem_word.
+    `01` + 32 data bits LSB-first + six zero bits.
     """
     head = _telegram(CMD_WRITEMEM, ((addr & 0xFFFFFFFC) << 8) | 0x04, 40)
     payload = (0b10 | ((value & 0xFFFFFFFF) << 2)).to_bytes(5, "little")
@@ -250,7 +247,7 @@ class Dap:
             return None
 
     def read_word_retry(self, addr, tries=2):
-        """try_read_word, re-sending the connect handshake before each retry: on a
+        """try_read_word, re-sending the connect handshake before each retry: on
         TC4D7 a failed read leaves later reads unanswered until it is re-sent."""
         for attempt in range(tries):
             if attempt:
@@ -305,7 +302,7 @@ class Dap:
         The SSW's COMDATA dialogue has to be entered within a couple of ms of
         the reset release, so the reset uses a short settle and the whole key
         exchange rides in one USB transfer (no round trip between the OJCONF
-        write and the key word). Timing matches dap_unlock.attempt_until_evaluated.
+        write and the key word).
         """
         self.pulse_reset(hold, settle)
         steps = [(_DAPISC16, 5), (_DAPISC48, 5), (_SEL, 3), (_POLL, 9),

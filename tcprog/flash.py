@@ -2,10 +2,9 @@
 # Copyright (c) 2026 Aron Szabo <aron@aron.ws>
 """Flash Standard Interface (FSI) programmer and UCB reads.
 
-Command sequences are Infineon's own, transcribed verbatim from the iLLD
-IfxFlash.h (Flash/Std) so tcprog drives the flash exactly as the on-chip driver
-does, only over DAP WRITEMEM instead of from the CPU. Command interface base
-0xAF000000; program addresses use the cached 0xA0000000 PFLASH alias.
+tcprog issues the flash command sequences over DAP WRITEMEM instead of from a
+CPU. The command interface is at 0xAF000000 on TC3xx and 0xF8080000 on TC4xx;
+command addresses must use the non-cached 0xA0000000 PFLASH alias.
 """
 import os
 import sys
@@ -22,11 +21,10 @@ FSI_BASE = 0xAF000000               # TC3xx command base (back-compat default)
 # 0x50 = Erase Logical Sector Range (DESTRUCTIVE). Never confuse the two.
 FSI_ERASE_CYCLE2 = 0x50
 FSI_VERIFY_ERASED_CYCLE2 = 0x5F
-PFLASH_PAGE, DFLASH_PAGE = 32, 8    # IFXFLASH_{PFLASH,DFLASH}_PAGE_LENGTH
+PFLASH_PAGE, DFLASH_PAGE = 32, 8
 PFLASH_LOG_SECTOR = 0x4000          # 16 KiB logical sector (TC3xx 6 MB / TC4 20 MB)
 
-# TC4 HCI_STATUS completion handshake (IfxFlash_isRequestReceived/Executed)
-# and the page-mode flags (TC4Dx UM v1.1 HCI_STATUS).
+# TC4 HCI_STATUS completion handshake and page-mode flags.
 HCI_REQACK, HCI_REQDONE = 1 << 30, 1 << 31
 HCI_DFPAGE, HCI_PFPAGE = 1 << 24, 1 << 25
 
@@ -40,14 +38,14 @@ ERASE_MAX_PFLASH, ERASE_MAX_DFLASH = 512 * 1024, 256 * 1024
 
 class FlashProfile:
     """Per-family parameters for the FSI command interface and its DMU status/
-    error registers. The command *sequences* are byte-identical across TC3xx and
-    TC4 (verbatim from iLLD IfxFlash.h); only the command base, the DMU register
-    map, the EVER/PVER bit positions, and the completion-wait style differ. This
-    captures exactly those, so one Flash driver covers both families.
+    error registers. The command *sequences* are the same on TC3xx and TC4;
+    only the command base, the DMU register map, the EVER/PVER bit positions,
+    and the completion-wait style differ. This captures exactly those, so one
+    Flash driver covers both.
 
-    wait: "busy" polls the per-bank busy bits in the status register (TC3xx 2G
+    wait: "busy" polls the per-bank busy bits in the status register (TC3xx
     DMU HF_STATUS); "reqdone" waits on the REQACK->REQDONE handshake in TC4's
-    HCI_STATUS, the sequence the TC4 iLLD itself uses after a command.
+    HCI_STATUS.
     """
     def __init__(self, *, cmd_base, errsr, errsr_name, ever_bit, pver_bit,
                  reject_mask, clre, clre_clear_all, status, wait,
@@ -63,8 +61,8 @@ class FlashProfile:
         self.clre_clear_all = clre_clear_all
         self.status = status
         self.wait = wait
-        # Load-page offsets for a 32-bit master (iLLD IfxFlash_loadPage2X32):
-        # TC3xx takes lo at 0x55F0 then hi at 0x55F4; TC4 streams both to 0x55F4.
+        # Load-page offsets for 32-bit writes: TC3xx takes lo at 0x55F0 then hi
+        # at 0x55F4; TC4 sends both to 0x55F4.
         self.load_lo = load_lo
         self.load_hi = load_hi
         # DFLASH lives at a family-specific base (TC3xx 0xAFxxxxxx, TC4 0xAExxxxxx)
@@ -82,8 +80,10 @@ class FlashProfile:
         self.unprotect = unprotect
 
 
-# TC3xx 2G DMU (Infra/Sfr IfxDmu_regdef.h): HF_* registers. EVER bit4, PVER
-# bit3; OPER/SQER/PROER are bits 0/1/2. Verified on TC375 silicon.
+# TC3xx DMU HF_* registers: EVER bit4, PVER bit3; OPER/SQER/PROER are bits
+# 0/1/2. UCBs are 512 B each at 0xAF400000. The
+# DFLASH logical sector is 4 KiB in single-ended mode; complement-sensing mode
+# (2 KiB) is not modelled.
 PROFILE_TC3XX = FlashProfile(
     cmd_base=0xAF000000,
     errsr=0xF8040034, errsr_name="HF_ERRSR", ever_bit=4, pver_bit=3,
@@ -96,11 +96,10 @@ PROFILE_TC3XX = FlashProfile(
     unprotect={"pflash": (0x10, 1 << 0),       # UCB_PFLASH, PRODISP
                "dflash": (0x11, 1 << 1)})      # UCB_DFLASH, PRODISD
 
-# TC4Dx DMU (Infra/Sfr/TC4Dx IfxDmu_reg.h + IfxDmu_bf.h): HCI_* registers.
-# Command base 0xF8080000 (IfxFlash_cfg_TC4Dx.h IFXFLASH_CMD_BASE_ADDRESS).
-# HCI_ERR @0xF8040010: EVER bit7, PVER bit6, OPER bit16, SQER bit1, PROER bit2.
-# HCI_CLRERR @0xF8040014 clears CADER..CEVER. HCI_STATUS @0xF8040004 carries the
-# REQACK/REQDONE handshake. Command sequences are identical to TC3xx.
+# TC4Dx DMU HCI_* registers. Command base 0xF8080000. HCI_ERR @0xF8040010:
+# EVER bit7, PVER bit6, OPER bit16, SQER bit1, PROER bit2. HCI_CLRERR
+# @0xF8040014 clears CADER..CEVER. HCI_STATUS @0xF8040004 carries the
+# REQACK/REQDONE handshake. UCB0 0xAE400000 and UCB1 0xAEC00000, 2 KiB per UCB.
 PROFILE_TC4XX = FlashProfile(
     cmd_base=0xF8080000,
     errsr=0xF8040010, errsr_name="HCI_ERR", ever_bit=7, pver_bit=6,
@@ -142,8 +141,8 @@ TC2_BMHD0, TC2_BMHD_SIZE = 0xA0000000, 32
 _CONFIRM = {0x43211234: "UNLOCKED", 0x57B5327F: "CONFIRMED",
             0x00000000: "ERASED (errored)"}
 
-# TC4xx: four 2 KiB BMHD blocks (iLLD Lcf .bmhd_N_org, Ifx_Ssw_Bmhd), each with
-# the 8-word password at +0x7D0 and the confirmation word (+ a copy) at +0x7F0/8.
+# TC4xx: four 2 KiB BMHD UCBs (UCB_RTC_BMHD0..3), each with the 8-word
+# password at +0x7D0 and the confirmation word (+ a copy) at +0x7F0/8.
 TC4_BMHD_BASE, TC4_BMHD_STRIDE, TC4_BMHD_COUNT = 0xAE404800, 0x800, 4
 TC4_CONFIRM_OFF, TC4_CONFIRM_COPY_OFF = 0x7F0, 0x7F8
 
@@ -211,7 +210,7 @@ def _pflash_sectors(addr, length):
 
 
 class Flash:
-    """The iLLD FSI command sequences over a Dap. Writes to flash; destructive.
+    """The FSI command sequences over a Dap. Writes to flash; destructive.
 
     `family` selects the per-family register profile (command base, DMU status/
     error map, EVER/PVER bits, wait style). Defaults to TC3xx so existing callers
@@ -263,7 +262,7 @@ class Flash:
     def _begin_cmd(self):
         """TC4: Clear Status before each command sequence. Only Clear Status (or
         Reset to Read) resets REQACK/REQDONE, so without it a REQDONE wait sees
-        the previous command's completion (UM 5.3.10.2). TC3xx waits on the BUSY
+        the previous command's completion. TC3xx waits on the BUSY
         bits instead and needs nothing here."""
         if self.p.wait == "reqdone":
             self.clear_status()
@@ -280,7 +279,7 @@ class Flash:
 
     def _wait_page_mode(self, page_addr, timeout=1.0):
         """TC4: wait for HCI_STATUS.PFPAGE/DFPAGE after Enter Page Mode, failing
-        early on a sequence/protection error (UM 5.3.10.2)."""
+        early on a sequence/protection error."""
         import time
         bit = HCI_PFPAGE if _is_pflash(_prog_alias(page_addr)) else HCI_DFPAGE
         deadline = time.monotonic() + timeout

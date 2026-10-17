@@ -38,7 +38,7 @@
             "kind": "ucb",
             "base": "0xAF400000",
             "size": "0x6000",
-            "_note": "UCB block, 48 x 512 B. NEVER write without --confirm-ucb."
+            "_note": "UCB block, 48 x 512 B. NEVER write without --enable-ucb-write."
         },
         {
             "name": "cfs",
@@ -59,14 +59,14 @@
             "kind": "psram",
             "base": "0xC0000000",
             "size": "0x2000",
-            "_note": "CPU0 PSPR; BSL loads stage 1 here (size is a family default)"
+            "_note": "CPU0 PSPR; BSL loads stage 1 here"
         },
         {
             "name": "dsram0",
             "kind": "dsram",
             "base": "0xD0000000",
             "size": "0x30000",
-            "_note": "CPU0 DSPR; payload stack+CSA (size is a family default)"
+            "_note": "CPU0 DSPR; payload stack+CSA"
         }
     ],
     "bsl_load": "0xC0000000",
@@ -80,5 +80,5 @@
     "procondf": "0xF8040088",
     "procondbg": "0xF8040090",
     "hf_protect": "0xF804001C",
-    "_notes": "Harvested from iLLD tc3xx (IfxFlash_cfg_TC33x.h)."
+    "_notes": "DF1/HSM is 128 KiB in single-ended mode (64 KiB in complement sensing)."
 }

@@ -119,7 +119,7 @@ def _hexdump(data, base, out=sys.stdout):
 # ======================================================================
 # BMHD (Boot Mode Header): parse / validate / build
 # CRC = CRC-32/ISO-HDLC (zlib.crc32) over the 8 header bytes, each 32-bit
-# word byte-swapped. Verified against a real BMHD (0x809FE5E2 / ~ = 0x7F601A1D).
+# word byte-swapped.
 # ======================================================================
 BMHDID = 0xB359
 HWCFG_FLASH, HWCFG_ABM, HWCFG_GEN_BSL, HWCFG_ASC_BSL = 0x7, 0x6, 0x4, 0x3
@@ -170,11 +170,11 @@ def validate_bmhd_tc3(data, chip=None):
     return (not problems), problems
 
 
-# TC2xx (AURIX 1G) Boot Mode Header, 32 bytes, from the TC2xx iLLD
-# BootModeHeader_0 (IfxCpu_CStart0.c). Layout differs from TC3xx: STADBM comes
+# TC2xx (AURIX 1G) Boot Mode Header, 32 bytes; the four BMHDs sit in PFLASH.
+# Layout differs from TC3xx: STADBM comes
 # first, then BMI|BMHDID in word 1, a CRC-checked code range (ChkStart..ChkEnd +
 # CRCrange/!CRCrange), and finally CRChead/!CRChead over the first 24 bytes.
-# The TC2xx BMI bit layout is not the TC3xx BMI[3:1]/[0] one, so BMI is raw.
+# The TC2xx BMI layout (PINDIS bit 3, HWCFG 6:4) is not the TC3xx one, so BMI is reported raw.
 def parse_bmhd_tc2(data):
     if len(data) < 32:
         raise ValueError("TC2xx BMHD is 32 bytes")
@@ -206,7 +206,7 @@ def validate_bmhd_tc2(data, chip=None):
         problems.append("STADBM 0x%08X not in program flash" % header["stadbm"])
     # CRChead covers STADBM..!CRCrange (the first 24 bytes), so it already
     # authenticates the CRCrange/!CRCrange fields; no separate inverted-pair check
-    # is needed (and the iLLD leaves both 0 when the range check is unused).
+    # is needed (both are left 0 when the range check is unused).
     # CRCrange itself covers the user code range, which the header alone cannot
     # recompute.
     expected = crc32_bmhd(data[0:24])
@@ -218,9 +218,8 @@ def validate_bmhd_tc2(data, chip=None):
 
 
 # TC4xx BMHD: SAL (the header's own address) | BMI | BMHDID | STAD | CRC, no
-# inverted CRC; the CRC also covers SAL. From iLLD Ifx_Ssw.h (TC4Dx), verified
-# against its four sample headers and a TC4D7 lite kit. The BMI bit meanings are
-# not in the iLLD, so the BMI is reported raw.
+# inverted CRC; the CRC covers the first 12 bytes, SAL included. The BMI
+# (bit 0 = 1, MODE 3:1, 15:4 = 0) is reported raw for now.
 def parse_bmhd_tc4(data):
     if len(data) < 16:
         raise ValueError("TC4xx BMHD is 16 bytes")

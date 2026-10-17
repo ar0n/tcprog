@@ -36,7 +36,7 @@
             "kind": "ucb",
             "base": "0xAF100000",
             "size": "0x4000",
-            "_note": "UCB block, 1G stride 0x400. NEVER write without --confirm-ucb."
+            "_note": "UCB block, 1G stride 0x400. NEVER write without --enable-ucb-write."
         },
         {
             "name": "dflash_hsm",
@@ -50,14 +50,14 @@
             "kind": "psram",
             "base": "0xC0000000",
             "size": "0x6000",
-            "_note": "CPU0 PSPR; BSL loads stage 1 here (size is a family default)"
+            "_note": "CPU0 PSPR; BSL loads stage 1 here"
         },
         {
             "name": "dsram0",
             "kind": "dsram",
             "base": "0xD0000000",
             "size": "0x1C000",
-            "_note": "CPU0 DSPR; payload stack+CSA (size is a family default)"
+            "_note": "CPU0 DSPR; payload stack+CSA"
         }
     ],
     "bsl_load": "0xC0000000",
@@ -71,5 +71,5 @@
     "procondf": null,
     "procondbg": "0xF8002058",
     "hf_protect": null,
-    "_notes": "Harvested from iLLD tc2xx (IfxFlash_cfg.h). 1G: WDT moved vs 2G; flash protection is the FLASH0 module (no DMU_HF_PROTECT/RPRO); proconpf/hf_protect null."
+    "_notes": "1G: flash protection is the FLASH0 module, not a DMU. UCBs are 1 KiB; the BMHDs are in PFLASH. write/erase are not supported on TC2xx."
 }
