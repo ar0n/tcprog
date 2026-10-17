@@ -22,10 +22,8 @@ dependencies = [
     "bincopy",          # firmware image parsing (SREC/HEX/ELF/bin/TI-TXT)
 ]
 
-[project.optional-dependencies]
-# The transports need system bindings, kept optional so list/chips/dry-run work bare:
-dap = ["ftdi1"]         # libftdi1 Python binding, for the FTDI-MPSSE DAP
-bsl = ["pyserial"]      # for the ASC BSL serial transport
+# The DAP transport also needs the libftdi1 Python binding (module `ftdi1`). It is
+# not on PyPI: install the distribution's package. list and --dry-run work without it.
 
 [project.scripts]
 tcprog = "tcprog.cli:main"

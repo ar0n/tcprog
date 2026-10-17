@@ -14,9 +14,9 @@ Python 3.8 or newer. A Python package: run it from a source checkout with
 `tcprog` command.
 
 - **bincopy** (required) parses firmware images.
-- **ftdi1**, the libftdi1 Python binding, is needed for the DAP transport
-  (`pip install .[dap]`, or your distribution's libftdi1 Python package).
-  `list`, `chips` and `--dry-run` work without it.
+- **ftdi1**, the libftdi1 Python binding, is needed for the DAP transport. It is
+  not on PyPI; install your distribution's libftdi1 Python bindings.
+  `list` and `--dry-run` work without it.
 - The user needs access to the probe's USB device (`058b:0043` for Infineon DAS
   probes), for example through a udev rule.
 
@@ -47,8 +47,10 @@ Lists attached FTDI/DAP probes, or the parts `--chip` accepts.
 
 ### ident
 
-Reads the identity register and reports the part: chip name (matched in the
-device database), step, HSM flag and PFLASH/DFLASH sizes. TC2xx and TC3xx use
+Reads the identity register and reports the part: chip name, step, HSM flag
+and PFLASH/DFLASH sizes. The chip name is matched in the device database, which
+currently holds identity values for the TC375 and TC4D7; other parts are not
+recognised automatically, so pass `-c`. TC2xx and TC3xx use
 `SCU_CHIPID` (its CHTEC field tells the generations apart); TC4xx has no
 `SCU_CHIPID`, so it reads `CBS_JTAGID` (`0xFA180080`) and reports the JTAG part
 number and version instead of the HSM flag. It reports identity only, not
@@ -62,7 +64,7 @@ protection state.
 ### read
 
 Dumps a range or a whole region to a file (bin/srec/hex) or as a hexdump. Reads
-are 1 KiB blocks batched over one USB transfer. Reading erased PFLASH raises an
+are 1 KiB blocks, 16 per USB transfer. Reading erased PFLASH raises an
 ECC error and can wedge the target, so it warns when a range falls outside a
 known memory slice. `--skip-erased` reads a mostly erased device and keeps only
 what answers; on TC3xx/TC4xx PFLASH it maps the range with `blankcheck` first and
@@ -71,7 +73,7 @@ reads only the programmed sectors (a whole TC4D7 in 18 s instead of 10 min).
 | Option | Meaning |
 |---|---|
 | `--addr`, `--length` | range to read |
-| `--region NAME` | read a whole region (needs `-c`) |
+| `--region pflash\|dflash` | read a whole region (needs `-c`) |
 | `-o`, `--output FILE` | output file (bin/srec/hex by extension); omit to hexdump |
 | `--format FMT` | override the output format |
 | `--skip-erased`, `--sparse` | keep only what answers and emit a sparse image (srec/hex) |
@@ -98,11 +100,10 @@ DFLASH), programs page by page, then verifies by reading back. It runs the
 memory-map allowlist and the UCB gate, shows the range, regions (UCBs by name)
 and sector count, and asks before touching flash.
 
-On TC3xx a running application can make PFLASH program/erase fail (the startup
-code locks it, e.g. via Safety ENDINIT). For PFLASH, `write` and `erase` therefore
-reset the part with a halt-after-reset request, keep CPU0 at its first
-instruction during the operation, and reset again afterwards so the application
-restarts.
+On TC3xx, PFLASH program/erase can be refused while the application runs. For
+PFLASH, `write` and `erase` therefore reset the part with a halt-after-reset
+request, keep CPU0 at its first instruction during the operation, and reset again
+afterwards so the application restarts.
 
 | Option | Meaning |
 |---|---|
@@ -130,7 +131,7 @@ success. Asks before erasing.
 | Option | Meaning |
 |---|---|
 | `--addr`, `--length` | range to erase, rounded out to whole sectors |
-| `--region NAME` | erase a whole region (needs `--allow-erase-all`) |
+| `--region pflash` | erase all of PFLASH (needs `--allow-erase-all`) |
 | `--allow-erase-all` | required to erase a whole region |
 | `-y`, `--yes` | answer yes to the confirmation prompt |
 
@@ -142,7 +143,7 @@ Verify-Erased command (TC3xx and TC4xx): no array reads, so no ECC traps.
 | Option | Meaning |
 |---|---|
 | `--addr`, `--length` | range to check, rounded out to whole sectors |
-| `--region NAME` | check a whole region |
+| `--region pflash` | check all of PFLASH |
 | `--no-progress` | no progress output |
 
 ### Common options
@@ -171,8 +172,8 @@ Accepted but not implemented yet: `write --region`, `--preserve`, `--before`,
 
 ## Protection and unlocking
 
-- `--debug-unlock-pw` opens a debug-locked TC2xx/TC3xx part with the 256-bit
-  debug password (Cerberus key exchange at startup). It takes exactly 8
+- `--debug-unlock-pw` opens a debug-locked TC3xx part (TC2xx uses the same exchange
+  but is untested) with the 256-bit debug password (Cerberus key exchange at startup). It takes exactly 8
   comma-separated words (e.g. `1,2,3,4,5,6,7,8` or `0x00000000,0x11111111,...`)
   and usually succeeds on the first attempt; it retries up to `--unlock-tries`
   times (default 3).
@@ -205,9 +206,11 @@ Accepted but not implemented yet: `write --region`, `--preserve`, `--before`,
   ask before touching flash.
 - `--enable-ucb-write` is required for any write that lands in a UCB region;
   without it the write is refused (exit 82). A wrong UCB can lock you out of the
-  part or stop it booting; a CONFIRMED UCB cannot be changed back.
-- BMHD validation mirrors the startup software's acceptance checks, to catch a
-  header that would not boot.
+  part or stop it booting. A CONFIRMED UCB can only be changed with its password
+  (Disable Protection, then erase and reprogram); without the password, and for
+  UCBs that have no password such as the OTP sets, it is permanent.
+- BMHD validation follows the boot mode header checks documented for the startup
+  software (SSW) in the user manuals, to catch a header that would not boot.
 
 ## Exit codes
 
@@ -229,8 +232,8 @@ Accepted but not implemented yet: `write --region`, `--preserve`, `--before`,
 Each part is a JSON file in `tcprog/devices/`: the memory map as an explicit
 **list of slices** (the AURIX map has gaps: PFLASH, hole, DFLASH0, hole, UCB,
 hole, CFS, DF1/HSM), plus protection and watchdog registers. `--chip` selects one
-by name or part-number alias (e.g. `tc397`, `tc275`); `ident` detects it
-otherwise.
+by name or part-number alias (e.g. `tc397`, `tc275`). Automatic detection
+works only for parts whose identity value is in the database (TC375, TC4D7).
 
 Coverage: TC2xx `tc22x/tc23x/tc26x/tc27x/tc29x`; TC3xx
 `tc33x/tc35x/tc36x/tc37x(=tc375)/tc38x/tc39x`; TC4xx `tc4dx`. The TC22x and TC23x
@@ -291,7 +294,7 @@ Not yet:
       flash.py            flash driver (erase/program/verify), UCB reads, next-boot check
       chips.py            device database (Chip, lookup/detect)
       image.py            firmware image parse/emit + BMHD
-      util.py             exit codes, logging, Fail
+      util.py             exit codes, logging, progress output, Fail
       devices/*.json      device database (memory map + registers, one per part)
     LICENSE               MIT
 

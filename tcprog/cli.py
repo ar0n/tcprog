@@ -234,7 +234,7 @@ def _add_write_args(p):
     s.add_argument("--timeout", type=int, default=120, help="abort after N seconds [default: 120]")
     s.add_argument("--allow-erase-all", action="store_true", help="required for a full-chip erase")
     s.add_argument("--enable-ucb-write", action="store_true",
-                   help="[EXPERIMENTAL] required to write a UCB region; IRREVERSIBLE, can brick")
+                   help="required to write a UCB region; a wrong UCB can lock you out or brick the part")
     s.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
     s.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     s.add_argument("--log-file", help="append a full debug log here")
@@ -367,9 +367,9 @@ def _unlock_if_locked(dap, args, chip=None, halt=False):
 
 
 def _halt_cpu(dap, chip, was_locked):
-    """TC3xx: PFLASH program/erase is refused (PROER) once the application has
-    started (e.g. it sets Safety ENDINIT), so reset with Halt-After-Reset and
-    keep CPU0 at its first instruction during the flash operation."""
+    """TC3xx: PFLASH program/erase can be refused (PROER) once the application
+    has started, so reset with Halt-After-Reset and keep CPU0 at its first
+    instruction during the flash operation."""
     if was_locked:
         log("tcprog: warning - not halting CPU0: the part was debug-locked and a "
             "halt-after-reset would lock it again; PFLASH program/erase may be "
@@ -862,7 +862,7 @@ def _cmd_write(args):
     ucb_segments = [s for s in image.segments if chip.region_of(s.addr) == "ucb"]
     if ucb_segments and not args.enable_ucb_write:
         return _error("REFUSED - image writes to the UCB region (%s) and --enable-ucb-write "
-                     "is not set. UCB writes are IRREVERSIBLE and can brick the part."
+                     "is not set. A wrong UCB can lock you out of the part or brick it."
                      % ", ".join("0x%08X" % s.addr for s in ucb_segments), EX_REFUSED)
 
     # Confirm before touching flash (destructive, irreversible).
