@@ -103,8 +103,7 @@ _IO_SELECT = (
 # CMD_KEY_EXCHANGE into the COMDATA mailbox opens it; eight further words are the
 # 256-bit password. Acceptance is proven by a memory read succeeding afterwards,
 # not by any status word (a wrong password also has all eight words taken). The
-# window is short and entry is stochastic, so callers retry. See
-# ../bootrom/NOTES-cerberus-unlock.md.
+# window is short, so callers allow a retry; it usually lands first time.
 CMD_KEY_EXCHANGE = 0x76D6E24A
 REG_COMDATA = 0x4
 IOINFO_DIALOGUE = 0x00380080          # startup software listening for the key
@@ -313,12 +312,11 @@ class Dap:
         chipid = self.try_read_word(0xF0036140)
         return (chipid not in (None, 0, 0xFFFFFFFF)), chipid
 
-    def unlock(self, words, tries=10, settle=0.0, on_attempt=None):
+    def unlock(self, words, tries=3, settle=0.0, on_attempt=None):
         """Retry the key exchange until it unlocks. -> (unlocked, chipid, tries).
 
-        Reaching the window is stochastic and a correct password unlocks only a
-        fraction of the attempts that reach it, so several tries are needed
-        before a candidate can be called wrong. `on_attempt(k, reached, error)`
+        A correct password usually unlocks on the first attempt; an occasional
+        miss of the startup window costs a second one. `on_attempt(k, reached, error)`
         is called once per try (error is a string on a transport failure, else None).
         """
         self.reached_count = 0

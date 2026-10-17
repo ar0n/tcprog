@@ -155,8 +155,8 @@ def _add_conn_args(p):
     s.add_argument("--debug-unlock-pw", default=os.environ.get("TCPROG_DEBUG_UNLOCK_PW"),
                    help="256-bit debug/JTAG password: 8 words w0,..,w7 (dec/0x-hex), or "
                         "one value repeated 8x. Env: TCPROG_DEBUG_UNLOCK_PW")
-    s.add_argument("--unlock-tries", type=int, default=10,
-                   help="max stochastic unlock attempts [default: 10]")
+    s.add_argument("--unlock-tries", type=int, default=3,
+                   help="max debug unlock attempts [default: 3]")
     s.add_argument("--pflash-unlock-pw", nargs="?", const="",
                    default=os.environ.get("TCPROG_PFLASH_UNLOCK_PW"),
                    help="disable PFLASH protection; value only if it differs from the "
