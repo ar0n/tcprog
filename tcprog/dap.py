@@ -29,23 +29,38 @@ def _locked(chipid):
     return chipid is None or chipid in (0, 0xFFFFFFFF)
 
 
+# Telegram CRC: CRC-6 with polynomial x^6 + x + 1, register initialised to 1,
+# fed the telegram bits in transmission order, result bit-reversed, no final XOR.
+_CRC6_POLY, _CRC6_INIT = 0x03, 0x01
+
+
 def _crc6(bits):
-    c = 0x3F
+    """CRC-6 of a bit sequence given in transmission order. -> 6-bit value."""
+    reg = _CRC6_INIT
     for bit in bits:
-        b = (bit ^ c ^ (c >> 1)) & 1
-        c = ((b << 5) | (c >> 1)) & 0x3F
-    return (c ^ (c >> 1)) & 0x3F
+        feedback = ((reg >> 5) & 1) ^ bit
+        reg = (reg << 1) & 0x3F
+        if feedback:
+            reg ^= _CRC6_POLY
+    return int("{:06b}".format(reg)[::-1], 2)
 
 
 def _telegram(cmd, arg, arglen):
-    body = [1]
-    for n, width in ((cmd, 5), (arglen, 6), (arg, arglen)):
-        body += [(n >> k) & 1 for k in range(width)]
-    bits = body + [(_crc6(body) >> k) & 1 for k in range(6)]
-    if bits[-1] == 1:
-        bits.append(0)
-    bits = [0] * ((-len(bits)) % 8) + bits
-    return bytes(sum(bits[i + k] << k for k in range(8)) for i in range(0, len(bits), 8))
+    """Encode one DAP telegram. Fields go out LSB first in this order: a start
+    bit (1), cmd (5 bits), arglen (6 bits), arg (arglen bits), CRC-6 (6 bits).
+    A telegram must not end on a 1, so a 0 follows a final 1; zero bits are put
+    in front to fill whole bytes. The stream is an integer whose bit i is the
+    i-th bit on the wire, sent as little-endian bytes."""
+    stream, length = 0, 0
+    for value, width in ((1, 1), (cmd, 5), (arglen, 6), (arg, arglen)):
+        stream |= (value & ((1 << width) - 1)) << length
+        length += width
+    stream |= _crc6((stream >> i) & 1 for i in range(length)) << length
+    length += 6
+    if (stream >> (length - 1)) & 1:
+        length += 1
+    pad = -length % 8
+    return (stream << pad).to_bytes((length + pad) // 8, "little")
 
 
 def _readmem(addr, size_or_reg):
@@ -59,8 +74,7 @@ def _writemem_word(addr, value):
     `01` + 32 data bits LSB-first + six zero bits. From dap_proto.writemem_word.
     """
     head = _telegram(CMD_WRITEMEM, ((addr & 0xFFFFFFFC) << 8) | 0x04, 40)
-    bits = [0, 1] + [(value >> k) & 1 for k in range(32)] + [0] * 6
-    payload = bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(len(bits) // 8))
+    payload = (0b10 | ((value & 0xFFFFFFFF) << 2)).to_bytes(5, "little")
     return head, payload
 
 
