@@ -358,7 +358,9 @@ def _read_region(dap, addr, length):
     if lo >= hi:
         return read_words(dap, addr, length)[:length]
     out = read_words(dap, addr, lo - addr)
-    out += dap.read_blocks(list(range(lo, hi, Dap.BLOCK)))
+    blocks = list(range(lo, hi, Dap.BLOCK))
+    for index in range(0, len(blocks), 16):           # 16 blocks per USB transfer
+        out += dap.read_blocks(blocks[index:index + 16])
     out += read_words(dap, hi, end - hi)
     return bytes(out)[:length]
 
