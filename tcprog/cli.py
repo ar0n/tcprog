@@ -144,7 +144,8 @@ def _add_conn_args(p):
     g.add_argument("-p", "--probe", default=os.environ.get("TCPROG_PROBE"),
                    help="FTDI probe as VID:PID or VID:PID:SERIAL. Env: TCPROG_PROBE")
     g.add_argument("--speed", type=int, default=1000, help="DAP clock in kHz [default: 1000]")
-    g.add_argument("--connect-under-reset", action="store_true", help="hold PORST while attaching")
+    g.add_argument("--connect-under-reset", action="store_true",
+                   help="reset the target while attaching (default: leave it running)")
 
     b = p.add_argument_group("ASC BSL transport (-t asc-bsl)")
     b.add_argument("--asc-bsl-port", help="serial port for ASC BSL")
@@ -318,7 +319,8 @@ def _open_dap(args):
     Raises Fail on any error, with the right exit code."""
     vid, pid, serial = parse_probe(args.probe)
     try:
-        dap = Dap(serial, vid, pid, args.speed * 1000)
+        dap = Dap(serial, vid, pid, args.speed * 1000,
+                  reset_on_open=getattr(args, "connect_under_reset", False))
     except DapError as error:
         raise Fail(str(error), os.EX_UNAVAILABLE)
     except ImportError:

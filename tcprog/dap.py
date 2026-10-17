@@ -9,7 +9,8 @@ lazily so list/chips/dry-run need no USB.
 DEFAULT_VID, DEFAULT_PID = 0x058B, 0x0043
 _CMD_W, _CMD_R, _CMD_FLUSH = 0x19, 0x28, 0x87
 _ADBUS_VAL, _ADBUS_DIR, _ACBUS_DIR = 0x80, 0xDB, 0xF7
-_ACBUS_IDLE, _ACBUS_TX, _ACBUS_RX = 0x55, 0x67, 0x57
+# ACBUS1 is nSRST (active low): IDLE keeps it released, IDLE_RESET asserts it.
+_ACBUS_IDLE, _ACBUS_IDLE_RESET, _ACBUS_TX, _ACBUS_RX = 0x57, 0x55, 0x67, 0x57
 CMD_WRITEREG, CMD_WRITEMEM, CMD_READMEM, CMD_DAPISC, CMD_READREG, CMD_SET_IO_CLIENT = 8, 9, 10, 17, 26, 28
 REG_READ32 = 0x5
 SCU_CHIPID = 0xF0036140          # target identity register (TC2xx/TC3xx)
@@ -154,7 +155,10 @@ def parse_probe(text):
 
 
 class Dap:
-    def __init__(self, serial=None, vid=DEFAULT_VID, pid=DEFAULT_PID, hz=1_000_000):
+    def __init__(self, serial=None, vid=DEFAULT_VID, pid=DEFAULT_PID, hz=1_000_000,
+                 reset_on_open=False):
+        """Open the probe. The target keeps running unless reset_on_open, which
+        holds nSRST while the link is set up; the first transfer releases it."""
         import ftdi1 as ftdi
         self._ftdi = ftdi
         self.ctx = ftdi.new()
@@ -175,7 +179,8 @@ class Dap:
         div = max(0, int(round(60e6 / (2 * hz))) - 1)
         self._w(bytes((0x8A, 0x97, 0x8D)) + bytes((0x86, div & 0xFF, (div >> 8) & 0xFF))
                 + bytes((0x80, _ADBUS_VAL, _ADBUS_DIR))
-                + bytes((0x82, _ACBUS_IDLE, _ACBUS_DIR)))
+                + bytes((0x82, _ACBUS_IDLE_RESET if reset_on_open else _ACBUS_IDLE,
+                         _ACBUS_DIR)))
         self.hz = 60e6 / (2 * (div + 1))
 
     def _flush(self):
