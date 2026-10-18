@@ -6,59 +6,175 @@ import glob
 import json
 import os
 import sys
+import time
 
 import bincopy
 
 from . import __version__ as VERSION
-from .chips import all_chips, by_chipid, chipid_addrs, _resolve_chip
+from .chips import all_chips, by_id, id_addrs, lookup_chip, _resolve_chip
 from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
                   _locked, _unlock_failed_msg)
-from .flash import (Flash, PFLASH_LOG_SECTOR, _CONFIRM, _busy_mask, _flash_sectors,
-                    _is_dflash, _is_pflash, _pflash_sectors, _program, _read_ucbs,
-                    _sector_size, blank_map, bmhd_blocks, profile_for_family,
-                    next_boot_report, read_region_blankcheck, read_region_sparse, read_words)
-from .image import load_image, _emit, _hexdump, _out_format
-from .util import EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, Progress, _error, log, set_verbose
+from .flash import (Flash, ReadFailed, _block_span, _flash_sectors,
+                    _read_region, confirm_unknown, device_map_problem, driven_layout,
+                    drives, erase_plan, _is_pflash, _program,
+                    _read_ucbs, _log_sector_size, bmhd_blocks, next_boot_report,
+                    blankcheck_geometry, read_region_blankcheck, read_region_sparse,
+                    read_words, ucb_name)
+from .image import flat_binary, load_image, _hexdump, _out_format
+from .util import (EX_CHECK, EX_REFUSED, EX_VERIFY, Fail, Progress, _error, log, set_verbose,
+                   warn)
 
-DESCRIPTION = "AURIX TC2xx/TC3xx/TC4xx flash programmer over an FTDI-MPSSE DAP or ASC BSL."
+DESCRIPTION = """AURIX TC2xx/TC3xx/TC4xx flash programmer for DAP probes based on FTDI chips
+(e.g. miniWiggler).
 
-EPILOG = r"""examples:
+commands:
+  list         list attached probes or supported chips
+  ident        connect and report the target (writes nothing)
+  read         read flash or memory to a file
+  ucb          read, verify or export the User Configuration Blocks
+  write        program a firmware image to flash
+  erase        erase flash sectors
+
+common options (ident, read, ucb, write, erase):
+  target    -c/--chip, --device
+  probe     -p/--probe, --speed, --connect-under-reset
+  unlock    --debug-unlock-pw, --unlock-tries, --pflash-unlock-pw, --dflash-unlock-pw
+  output    -q/--quiet, -v/--verbose"""
+
+EPILOG = """examples:
   tcprog list probes
-  tcprog list chips
-  tcprog ident --probe 058b:0043:MWAJFJ9N
-  tcprog ucb -c tc375 -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8
-  tcprog write -c tc375 -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8 app.elf
-  tcprog read -p 058b:0043:MWAJFJ9N --debug-unlock-pw 1,2,3,4,5,6,7,8 --addr 0x80000000 --length 0x6c00 -o flash.bin
-  tcprog write --dry-run -c tc375 app.srec
+  tcprog ident -p 058b:0043:<serial>
+  tcprog write -c tc375 -p 058b:0043:<serial> app.srec
+  tcprog read -c tc375 -p 058b:0043:<serial> --region pflash --skip-blank -o dump.srec
 
 exit codes:
-  0  ok                      64 usage (bad args)     65 bad image/data
-  69 no probe/target/binding 73 cannot write output  74 transfer failed
-  75 timeout                 77 debug-locked          80 ident --check mismatch
-  81 verify mismatch         82 refused (safety, e.g. UCB write w/o flag)
+  0 ok   64 usage   65 bad image   69 no probe/target   73 cannot write output
+  74 transfer failed   77 debug-locked   80 ident --check mismatch
+  81 verify mismatch   82 refused for safety
 
 environment:
-  TCPROG_CHIP (target part), TCPROG_PROBE, TCPROG_TRANSPORT, TCPROG_DEBUG_UNLOCK_PW,
+  TCPROG_CHIP, TCPROG_PROBE, TCPROG_DEBUG_UNLOCK_PW,
   TCPROG_PFLASH_UNLOCK_PW, TCPROG_DFLASH_UNLOCK_PW
 
-Run `tcprog <command> --help` for a command's options. tcprog does not debug,
-halt, or emulate. It programs flash and reports the target.
-"""
+Run `tcprog <command> --help` for a command's options."""
+
+BANNER = "tcprog %s ( https://github.com/ar0n/tcprog )" % VERSION
+
+_AFTER_HELP = ("if CPU0 was halted for the operation: reset restarts the application, "
+               "no-reset/halt leave CPU0 halted [default: reset]")
+
+
+_HELP_COLUMN = 30
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser whose help lists the command's own options first and the
+    options shared by all target commands last, indented under "common options".
+    Groups marked `common` are the shared ones; `examples` lines end the help."""
+    examples = ()
+
+    def _get_formatter(self):
+        return self.formatter_class(prog=self.prog, max_help_position=_HELP_COLUMN)
+
+    def error(self, message):
+        """Bad arguments: the usage line, then `tcprog: error: ...` like every other
+        error, and EX_USAGE."""
+        self.print_usage(sys.stderr)
+        self.exit(os.EX_USAGE, "tcprog: error: %s\n" % message)
+
+    def format_help(self):
+        common = [group for group in self._action_groups if getattr(group, "common", False)]
+        formatter = self._get_formatter()
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.description)
+        for group in self._action_groups:
+            if group in common:
+                continue
+            formatter.start_section(group.title)
+            formatter.add_text(group.description)
+            formatter.add_arguments(group._group_actions)
+            formatter.end_section()
+        formatter.add_text(self.epilog)
+        formatter._action_max_length = _HELP_COLUMN       # same help column everywhere
+        text = formatter.format_help()
+        if common:
+            nested = self._get_formatter()
+            nested._width -= 2
+            nested._max_help_position -= 2
+            for group in common:
+                nested.start_section(group.title)
+                nested.add_arguments(group._group_actions)
+                nested.end_section()
+            nested._action_max_length = _HELP_COLUMN
+            body = nested.format_help().strip("\n")
+            text += "\ncommon options:\n" + "\n".join(
+                "  " + line for line in body.split("\n") if line) + "\n"
+        if self.examples:
+            text += "\nexamples:\n" + "".join("  %s\n" % line for line in self.examples)
+        return BANNER + "\n" + text
+
+
+def _add_common_args(p):
+    """The options shared by ident, read, ucb, write and erase."""
+    def group(title):
+        g = p.add_argument_group(title)
+        g.common = True
+        return g
+
+    t = group("target")
+    t.add_argument("-c", "--chip", default=os.environ.get("TCPROG_CHIP"),
+                   help="target part or family (e.g. tc375, tc37x, tc4d7), or auto to detect it. "
+                        "Env: TCPROG_CHIP")
+    t.add_argument("--device", metavar="FILE",
+                   help="custom device file (TOML, or older JSON); its address ranges "
+                        "act as the write allowlist")
+    b = group("probe")
+    b.add_argument("-p", "--probe", default=os.environ.get("TCPROG_PROBE"),
+                   help="FTDI probe as VID:PID or VID:PID:SERIAL (e.g. 058b:0043:<serial>). "
+                        "Env: TCPROG_PROBE")
+    b.add_argument("--speed", type=int, default=1000, metavar="KHZ",
+                   help="DAP clock in kHz [default: 1000]")
+    b.add_argument("--connect-under-reset", action="store_true",
+                   help="reset the target while attaching")
+    u = group("unlock")
+    u.add_argument("--debug-unlock-pw", default=os.environ.get("TCPROG_DEBUG_UNLOCK_PW"),
+                   metavar="PW",
+                   help="256-bit debug password, 8 words (e.g. 1,2,3,4,5,6,7,8). "
+                        "Env: TCPROG_DEBUG_UNLOCK_PW")
+    u.add_argument("--unlock-tries", type=int, default=3, metavar="N",
+                   help="max debug unlock attempts [default: 3]")
+    u.add_argument("--pflash-unlock-pw", nargs="?", const="", metavar="PW",
+                   default=os.environ.get("TCPROG_PFLASH_UNLOCK_PW"),
+                   help="lift PFLASH protection; without a value the debug password is "
+                        "used. Env: TCPROG_PFLASH_UNLOCK_PW")
+    u.add_argument("--dflash-unlock-pw", nargs="?", const="", metavar="PW",
+                   default=os.environ.get("TCPROG_DFLASH_UNLOCK_PW"),
+                   help="lift DFLASH protection, as above. Env: TCPROG_DFLASH_UNLOCK_PW")
+    o = group("output")
+    o.add_argument("-q", "--quiet", action="store_true", help="only print errors")
+    o.add_argument("-v", "--verbose", action="store_true", help="more detail")
+    return p
+
+
+def _regions(text):
+    """--region value: a comma list of address range names. -> [name]"""
+    names = list(dict.fromkeys(name.strip() for name in text.split(",")))
+    if "" in names:
+        raise argparse.ArgumentTypeError("empty region name in %r" % text)
+    return names
 
 
 def _hexint(s):
     return int(s, 0)
 
 
-def _attempt_logger():
-    """A dap.unlock(on_attempt=...) callback that logs each try under -v."""
-    def cb(k, reached, error):
-        if error is not None:
-            log("  attempt %d: error: %s" % (k, error), verbose=True)
-        else:
-            log("  attempt %d: %s" % (k, "reached dialogue" if reached else "missed window"),
-                verbose=True)
-    return cb
+def _log_attempt(k, reached, error):
+    """dap.unlock(on_attempt=...) callback: log each try under -v."""
+    if error is not None:
+        log("  attempt %d: error: %s" % (k, error), verbose=True)
+    else:
+        log("  attempt %d: %s" % (k, "reached dialogue" if reached else "missed window"),
+            verbose=True)
 
 
 def _decode_chipid(v):
@@ -80,11 +196,6 @@ def _decode_jtagid(v):
     return {"version": (v >> 28) & 0xF, "part": (v >> 12) & 0xFFFF, "manuf": (v >> 1) & 0x7FF}
 
 
-def _todo(cmd):
-    return _error("'%s' not implemented yet (needs the DAP/ASC-BSL transport)." % cmd,
-                  os.EX_UNAVAILABLE)
-
-
 # ======================================================================
 # list
 # ======================================================================
@@ -92,7 +203,9 @@ def _cmd_list(args):
     if args.what is None:
         args._parser.print_help()
         return os.EX_OK
-    return _list_chips() if args.what == "chips" else _list_probes()
+    if args.what == "chips":
+        return _show_chip(args.name) if args.name else _list_chips()
+    return _list_probes()
 
 
 def _list_probes():
@@ -102,24 +215,27 @@ def _list_probes():
         (0x0403, 0x6014): "Generic FT232H (MPSSE)",
         (0x058b, 0x0043): "Infineon DAS (miniWiggler / on-board)",
     }
+    def read_attr(dev_dir, name):
+        try:
+            with open(dev_dir + name) as handle:
+                return handle.read().strip()
+        except OSError:
+            return None
+
     probes = []
     for dev_dir in sorted(glob.glob("/sys/bus/usb/devices/*/")):
-        def read_attr(name):
-            try:
-                return open(dev_dir + name).read().strip()
-            except OSError:
-                return None
-        vendor_s, product_s = read_attr("idVendor"), read_attr("idProduct")
+        vendor_s, product_s = read_attr(dev_dir, "idVendor"), read_attr(dev_dir, "idProduct")
         if not vendor_s or not product_s:
             continue
         vid, pid = int(vendor_s, 16), int(product_s, 16)
         if (vid, pid) not in KNOWN:
             continue
-        probes.append((vid, pid, read_attr("serial"), read_attr("product"), KNOWN[(vid, pid)]))
+        probes.append((vid, pid, read_attr(dev_dir, "serial"), read_attr(dev_dir, "product"),
+                       KNOWN[(vid, pid)]))
 
     print("PROBES (use with --probe VID:PID or VID:PID:SERIAL):")
     if not probes:
-        print("  none found (looked for FTDI 0403:* and Infineon 058b:0043)")
+        print("  none found (looked for FTDI 0403:6010/6011/6014 and Infineon 058b:0043)")
     for vid, pid, serial, product, kind in probes:
         probe_id = "%04x:%04x%s" % (vid, pid, ":" + serial if serial else "")
         print("  %-22s %s" % (probe_id, product or kind))
@@ -130,193 +246,160 @@ def _list_chips():
     print("%-8s %-7s %s" % ("chip", "family", "aliases"))
     for chip in all_chips():
         print("%-8s %-7s %s" % (chip.name, chip.family, ", ".join(chip.aliases)))
-    print("\nAdd parts by dropping a JSON file in the devices/ dir of the package.")
+    print("\nAdd parts by dropping a TOML file in the devices/ dir of the package, or "
+          "pass one with --device.")
+    return os.EX_OK
+
+
+def _show_chip(name):
+    """One part's memory map as tcprog uses it, inherited ranges included."""
+    chip = lookup_chip(name)
+    if chip is None:
+        return _error("unknown chip %r (see `tcprog list chips`)" % name, os.EX_USAGE)
+    print("%s (%s)%s" % (chip.name, chip.family,
+                        "  aliases: " + ", ".join(chip.aliases) if chip.aliases else ""))
+    for r in sorted(chip.memory, key=lambda r: r.base):
+        flags = [flag for flag in ("write_protected", "erase_protected") if getattr(r, flag)]
+        print(("  %-14s %-6s 0x%08X..0x%08X  %8s  %s"
+               % (r.name, r.kind, r.base, r.end, _size(r.size), " ".join(flags))).rstrip())
+    for code, banks in sorted(chip.pflash_variants.items()):
+        print("  FSIZE %X: PFLASH %s" % (code, ", ".join(
+            "0x%08X..0x%08X" % (base, base + size) for base, size in banks)))
     return os.EX_OK
 
 
 # ======================================================================
 # argument groups
 # ======================================================================
-def _add_conn_args(p):
-    """Connection + credential options shared by ident / read / write."""
-    g = p.add_argument_group("connection / transport")
-    g.add_argument("-c", "--chip", default=os.environ.get("TCPROG_CHIP"),
-                   help="target part or family (e.g. tc375, tc37x, tc2xx); "
-                        "optional if ident detects it. Env: TCPROG_CHIP")
-    g.add_argument("--device", metavar="FILE",
-                   help="custom device JSON instead of a built-in part; its "
-                        "memory slices act as the write allowlist")
-    g.add_argument("-t", "--transport", default=os.environ.get("TCPROG_TRANSPORT", "dap"),
-                   choices=("dap", "asc-bsl"), help="link to the target [default: dap]")
-    g.add_argument("-p", "--probe", default=os.environ.get("TCPROG_PROBE"),
-                   help="FTDI probe as VID:PID or VID:PID:SERIAL. Env: TCPROG_PROBE")
-    g.add_argument("--speed", type=int, default=1000, help="DAP clock in kHz [default: 1000]")
-    g.add_argument("--connect-under-reset", action="store_true",
-                   help="reset the target while attaching (default: leave it running)")
-
-    b = p.add_argument_group("ASC BSL transport (-t asc-bsl)")
-    b.add_argument("--asc-bsl-port", help="serial port for ASC BSL")
-    b.add_argument("--asc-bsl-baud", type=int, default=115200, help="ASC BSL baud [default: 115200]")
-
-    s = p.add_argument_group("security (TC3xx/TC4xx protection - run ident first)")
-    s.add_argument("--debug-unlock-pw", default=os.environ.get("TCPROG_DEBUG_UNLOCK_PW"),
-                   help="256-bit debug/JTAG password: 8 comma-separated words w0,..,w7 "
-                        "(dec/0x-hex). Env: TCPROG_DEBUG_UNLOCK_PW")
-    s.add_argument("--unlock-tries", type=int, default=3,
-                   help="max debug unlock attempts [default: 3]")
-    s.add_argument("--pflash-unlock-pw", nargs="?", const="",
-                   default=os.environ.get("TCPROG_PFLASH_UNLOCK_PW"),
-                   help="disable PFLASH protection; value only if it differs from the "
-                        "debug password. Env: TCPROG_PFLASH_UNLOCK_PW")
-    s.add_argument("--dflash-unlock-pw", nargs="?", const="",
-                   default=os.environ.get("TCPROG_DFLASH_UNLOCK_PW"),
-                   help="disable DFLASH protection; value only if it differs from the "
-                        "debug password. Env: TCPROG_DFLASH_UNLOCK_PW")
-
-    o = p.add_argument_group("output")
-    o.add_argument("-q", "--quiet", action="store_true", help="only print errors")
-    o.add_argument("-v", "--verbose", action="count", default=0, help="more detail (repeatable)")
-    o.add_argument("--json", action="store_true", help="machine-readable result on stdout")
-    return p
-
-
-def _add_ident_args(p):
-    g = p.add_argument_group("ident")
-    g.add_argument("--check", metavar="NAME", help="exit 80 unless the detected chip matches NAME")
-    g.add_argument("--fields", metavar="LIST", help="comma-separated subset of fields to print")
-    return p
-
-
-def _add_read_args(p):
-    g = p.add_argument_group("read")
-    g.add_argument("--addr", type=_hexint, help="start address to read")
-    g.add_argument("--length", type=_hexint, help="number of bytes to read")
-    g.add_argument("--region", choices=("pflash", "dflash"),
-                   help="read a whole region (needs -c/--chip)")
-    g.add_argument("-o", "--output", help="output file (bin/srec/hex by extension); omit to hexdump")
-    g.add_argument("--format", choices=("srec", "hex", "bin"), default=None,
-                   help="override the output format")
-    g.add_argument("--skip-erased", "--sparse", dest="skip_erased", action="store_true",
-                   help="tolerate erased/unreadable blocks: keep only what answers and "
-                        "emit a sparse image (srec/hex). Needed to read a whole device "
-                        "whose flash is mostly erased.")
-    g.add_argument("--asc-bsl-compress", action="store_true", help="LZ4 the transfer (ASC BSL route)")
-    g.add_argument("--no-progress", action="store_true", help="disable the progress line")
-    return p
-
-
-def _add_write_args(p):
-    """Write-specific options (call after _add_conn_args)."""
-    p.add_argument("firmware", nargs="?", help="image to write (.elf/.hex/.srec/.bin)")
-    g = p.add_argument_group("image / write")
-    g.add_argument("-a", "--address", type=_hexint, help="load address for a raw .bin")
-    g.add_argument("--format", choices=("elf", "hex", "srec", "bin"),
-                   help="override the image format")
-    g.add_argument("--region", choices=("pflash", "dflash"),
-                   help="target region [default: inferred from address]")
-    g.add_argument("--no-verify", action="store_true", help="skip read-back verification")
-    g.add_argument("--erase", choices=("sectors", "none"), default="sectors",
-                   help="erase policy [default: sectors]")
-    g.add_argument("--preserve", action="append", default=[], metavar="RANGE",
-                   help="do not touch this region (repeatable)")
-    g.add_argument("--asc-bsl-compress", action="store_true", help="LZ4 the transfer (ASC BSL route)")
-
-    r = p.add_argument_group("reset")
-    r.add_argument("--before", choices=("default-reset", "no-reset", "porst"),
-                   default="default-reset", help="reset action before [default: default-reset]")
-    r.add_argument("--after", choices=("reset", "no-reset", "halt"), default="reset",
-                   help="after a TC3xx PFLASH write/erase (CPU0 is halted at reset for "
-                        "it): reset restarts the application, no-reset/halt leave "
-                        "CPU0 halted [default: reset]")
-
-    s = p.add_argument_group("safety")
-    s.add_argument("-n", "--dry-run", action="store_true", help="parse and plan, touch nothing")
-    s.add_argument("--timeout", type=int, default=120, help="abort after N seconds [default: 120]")
-    s.add_argument("--allow-erase-all", action="store_true", help="required for a full-chip erase")
-    s.add_argument("--enable-ucb-write", action="store_true",
-                   help="required to write a UCB region; a wrong UCB can lock you out or brick the part")
-    s.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
-    s.add_argument("--no-progress", action="store_true", help="disable the progress bar")
-    s.add_argument("--log-file", help="append a full debug log here")
-    return p
-
-
 def _build_parser():
-    """Top-level parser with a subcommand per action (proper argparse subparsers)."""
-    p = argparse.ArgumentParser(
-        prog="tcprog", description=DESCRIPTION,
+    """Top-level parser with one subcommand per action."""
+    p = _Parser(
+        prog="tcprog", usage="tcprog <command> [options]", description=DESCRIPTION,
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-V", "--version", action="version", version="tcprog " + VERSION)
-    sub = p.add_subparsers(dest="command", metavar="<command>")
+    sub = p.add_subparsers(dest="command", parser_class=_Parser, help=argparse.SUPPRESS)
 
-    pl = sub.add_parser("list", help="list attached probes or supported chips",
-                        description="List attached probes, or supported chips.")
+    pl = sub.add_parser("list", usage="tcprog list probes\n       tcprog list chips [NAME]",
+                        description="List attached probes, or the parts --chip accepts. "
+                                    "With a NAME, show that part's memory map.")
     pl.add_argument("what", nargs="?", choices=("probes", "chips"),
-                    help="probes | chips")
+                    help="probes: attached FTDI/DAP probes; chips: supported parts")
+    pl.add_argument("name", nargs="?", help="chips: a part name or alias")
     pl.set_defaults(func=_cmd_list, _parser=pl)
 
-    pi = sub.add_parser("ident", help="connect and report the target (writes nothing)",
-                        description="Connect and report the target; writes nothing.")
-    _add_conn_args(pi)
-    _add_ident_args(pi)
+    pi = sub.add_parser("ident", usage="tcprog ident [common options] [ident options]",
+                        description="Connect and report the target; writes nothing. With an "
+                                    "unlock option it also lifts the protection and leaves it "
+                                    "lifted until the next reset.")
+    g = pi.add_argument_group("ident options")
+    g.add_argument("--check", metavar="NAME", help="exit 80 unless the detected chip is NAME")
+    g.add_argument("--fields", metavar="LIST", help="comma-separated subset of fields to print")
+    g.add_argument("--json", action="store_true", help="result as JSON on stdout")
+    _add_common_args(pi)
+    pi.examples = (
+        'tcprog ident -p 058b:0043:<serial>',
+        'tcprog ident -p 058b:0043:<serial> --json',
+        'tcprog ident -p 058b:0043:<serial> --check tc375',
+)
     pi.set_defaults(func=_cmd_ident)
 
-    pr = sub.add_parser("read", help="read flash/memory to a file",
-                        description="Read flash/memory to a file (or hexdump to stdout).")
-    _add_conn_args(pr)
-    _add_read_args(pr)
+    pr = sub.add_parser("read", usage="tcprog read [common options] [read options]",
+                        description="Read flash or memory to a file, or hexdump it.")
+    g = pr.add_argument_group("read options")
+    g.add_argument("--addr", type=_hexint, help="start address")
+    g.add_argument("--length", type=_hexint, metavar="LEN", help="number of bytes")
+    g.add_argument("--region", type=_regions, metavar="NAME[,NAME]",
+                   help="read whole address ranges by name (e.g. pflash,dflash0,ucb)")
+    g.add_argument("-o", "--output", metavar="FILE",
+                   help="output file, bin/srec/hex by extension; omit to hexdump")
+    g.add_argument("--format", choices=("srec", "hex", "bin"),
+                   help="override the output format")
+    g.add_argument("--skip-blank", "--sparse", dest="skip_blank", action="store_true",
+                   help="read only the programmed data, skipping blank flash")
+    g.add_argument("--skip-erased", dest="skip_blank", action="store_true",
+                   help=argparse.SUPPRESS)       # the earlier name
+    g.add_argument("--json", action="store_true", help="result summary as JSON on stdout")
+    g.add_argument("--progress", action="store_true", help="show a progress line")
+    _add_common_args(pr)
+    pr.examples = (
+        'tcprog read -c tc375 -p 058b:0043:<serial> --addr 0xA0000000 --length 0x100',
+        'tcprog read -c tc375 -p 058b:0043:<serial> --addr 0xA0000000 --length 0x10000 -o app.bin',
+        'tcprog read -c tc375 -p 058b:0043:<serial> --region pflash,dflash0 --skip-blank -o flash.srec',
+)
     pr.set_defaults(func=_cmd_read)
 
-    pucb = sub.add_parser("ucb", help="read and decode the User Configuration Blocks",
-                          description="Read and decode the UCBs (confirmation state + BMHD).")
+    pucb = sub.add_parser("ucb",
+                          usage="tcprog ucb [common options] [decode|verify|export] [ucb options]",
+                          description="Read the UCBs: confirmation states, the boot mode "
+                                      "headers and, on TC3xx, the protection the next reset "
+                                      "installs.")
     pucb.add_argument("action", nargs="?", choices=("decode", "verify", "export"),
                       default="decode",
-                      help="decode (default), verify UCB integrity, or export the raw "
-                           "BMHD blocks to -o")
-    pucb.add_argument("-o", "--output", metavar="FILE",
-                      help="export: output file; bin/srec/hex by extension or --format")
-    pucb.add_argument("--format", choices=("bin", "srec", "hex"),
-                      help="export: output format (default: from the -o extension)")
-    _add_conn_args(pucb)
+                      help="decode (default), verify (exit 81 on a problem), or export the "
+                           "raw BMHD blocks to -o")
+    g = pucb.add_argument_group("ucb options")
+    g.add_argument("-o", "--output", metavar="FILE", help="export: output file")
+    g.add_argument("--format", choices=("bin", "srec", "hex"),
+                   help="export: output format [default: from the -o extension]")
+    g.add_argument("--json", action="store_true", help="decode/verify result as JSON on stdout")
+    _add_common_args(pucb)
+    pucb.examples = (
+        'tcprog ucb -c tc375 -p 058b:0043:<serial>',
+        'tcprog ucb verify -c tc375 -p 058b:0043:<serial>',
+        'tcprog ucb export -c tc375 -p 058b:0043:<serial> -o bmhd.srec',
+)
     pucb.set_defaults(func=_cmd_ucb)
 
-    pw = sub.add_parser("write", help="program a firmware image to flash",
-                        description="Program a firmware image to flash and verify it. "
-                                    "Requires -c/--chip (or --device): a write is gated on "
-                                    "the target's memory map, which tcprog will not guess.")
-    _add_conn_args(pw)
-    _add_write_args(pw)
+    pw = sub.add_parser("write", usage="tcprog write [common options] [write options] FIRMWARE",
+                        description="Program a firmware image to flash and verify it. Needs "
+                                    "-c/--chip or --device: a write is gated on the target's "
+                                    "memory map.")
+    pw.add_argument("firmware", nargs="?", metavar="FIRMWARE",
+                    help="image to write (.elf, .hex, .srec, .bin)")
+    g = pw.add_argument_group("write options")
+    g.add_argument("-a", "--address", type=_hexint, metavar="ADDR",
+                   help="load address for a raw .bin")
+    g.add_argument("--format", choices=("elf", "hex", "srec", "bin"),
+                   help="override the image format")
+    g.add_argument("--erase", choices=("sectors", "none"), default="sectors",
+                   help="erase the covered sectors first [default: sectors]")
+    g.add_argument("--no-verify", action="store_true", help="skip the read-back verification")
+    g.add_argument("--after", choices=("reset", "no-reset", "halt"), default="reset",
+                   help=_AFTER_HELP)
+    g.add_argument("--enable-ucb-write", action="store_true", help="allow writing a UCB region")
+    g.add_argument("-n", "--dry-run", action="store_true", help="parse and plan, touch nothing")
+    g.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
+    g.add_argument("--progress", action="store_true", help="show a progress line")
+    _add_common_args(pw)
+    pw.examples = (
+        'tcprog write -c tc375 -p 058b:0043:<serial> app.srec',
+        'tcprog write -n -c tc375 app.srec',
+        'tcprog write -c tc4d7 -p 058b:0043:<serial> --pflash-unlock-pw 1,2,3,4,5,6,7,8 app.srec',
+)
     pw.set_defaults(func=_cmd_write)
 
-    pe = sub.add_parser("erase", help="erase flash sectors without writing",
-                        description="Erase PFLASH sectors (16 KiB logical sectors). "
-                                    "Requires -c/--chip (or --device).")
-    _add_conn_args(pe)
-    ge = pe.add_argument_group("erase")
-    ge.add_argument("--addr", type=_hexint, help="start address (rounded down to a sector)")
-    ge.add_argument("--length", type=_hexint, help="bytes to erase (rounded up to sectors)")
-    ge.add_argument("--region", choices=("pflash",), help="erase a whole region")
-    ge.add_argument("--allow-erase-all", action="store_true",
-                    help="required to erase a whole region")
-    ge.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
+    pe = sub.add_parser("erase", usage="tcprog erase [common options] [erase options]",
+                        description="Erase flash sectors (PFLASH 16 KiB, DFLASH 4 KiB on TC3xx "
+                                    "/ 2 KiB on TC4xx). Needs -c/--chip or "
+                                    "--device.")
+    g = pe.add_argument_group("erase options")
+    g.add_argument("--addr", type=_hexint, help="start address, rounded down to a sector")
+    g.add_argument("--length", type=_hexint, metavar="LEN",
+                   help="bytes to erase, rounded up to whole sectors")
+    g.add_argument("--region", type=_regions, metavar="NAME[,NAME]",
+                   help="erase whole address ranges by name (e.g. pflash,dflash0)")
+    g.add_argument("--allow-erase-all", action="store_true", help="allow erasing a whole region")
+    g.add_argument("--enable-ucb-write", action="store_true", help="allow erasing a UCB")
+    g.add_argument("--after", choices=("reset", "no-reset", "halt"), default="reset",
+                   help=_AFTER_HELP)
+    g.add_argument("-y", "--yes", action="store_true", help="answer yes to the confirmation prompt")
+    _add_common_args(pe)
+    pe.examples = (
+        'tcprog erase -c tc375 -p 058b:0043:<serial> --addr 0xA0500000 --length 0x4000',
+        'tcprog erase -c tc375 -p 058b:0043:<serial> --region pflash --allow-erase-all',
+)
     pe.set_defaults(func=_cmd_erase)
 
-    pbc = sub.add_parser("blankcheck", help="map programmed vs erased flash with the "
-                                            "controller's hardware blank-check",
-                         description="Report which PFLASH sectors are programmed, using the "
-                                     "flash controller's Verify-Erased command (no array "
-                                     "reads, no ECC traps). Non-destructive. TC3xx and TC4xx.")
-    _add_conn_args(pbc)
-    gbc = pbc.add_argument_group("blankcheck")
-    gbc.add_argument("--addr", type=_hexint, help="start address (rounded down to a sector)")
-    gbc.add_argument("--length", type=_hexint, help="bytes to check (rounded up to sectors)")
-    gbc.add_argument("--region", choices=("pflash",), help="check a whole region")
-    gbc.add_argument("--no-progress", action="store_true", help="disable the progress line")
-    pbc.set_defaults(func=_cmd_blankcheck)
-
-    pu = sub.add_parser("unlock", help="present the debug password / disable protection (not yet implemented)")
-    _add_conn_args(pu)
-    pu.set_defaults(func=lambda a: _todo("unlock"))
     return p
 
 
@@ -329,15 +412,15 @@ def _open_dap(args):
     vid, pid, serial = parse_probe(args.probe)
     try:
         dap = Dap(serial, vid, pid, args.speed * 1000,
-                  reset_on_open=getattr(args, "connect_under_reset", False))
+                  reset_on_open=args.connect_under_reset)
     except DapError as error:
         raise Fail(str(error), os.EX_UNAVAILABLE)
     except ImportError:
-        raise Fail("DAP needs the 'ftdi1' (libftdi1) Python binding", os.EX_UNAVAILABLE)
+        raise Fail("the DAP needs the 'ftdi1' (libftdi1) Python binding", os.EX_UNAVAILABLE)
     if not dap.connect():
         dap.close()
-        raise Fail("target did not answer (check cable/power, and that the part "
-                   "is not strapped to BSL)", os.EX_UNAVAILABLE)
+        raise Fail("target did not answer; check the cable and power, and that the part "
+                   "is not strapped to BSL", os.EX_UNAVAILABLE)
     return dap
 
 
@@ -345,7 +428,7 @@ def _read_identity(dap, chip=None):
     """Read the identity register: the known chip's, else each one in the DB in
     turn (SCU_CHIPID on TC2xx/TC3xx, CBS_JTAGID on TC4xx). -> (addr, value),
     value None if none answered."""
-    addrs = [chip.chipid_addr] if chip is not None and chip.chipid_addr else chipid_addrs()
+    addrs = [chip.id_addr] if chip is not None and chip.id_addr else id_addrs()
     for addr in addrs:
         value = dap.read_word_retry(addr)
         if not _locked(value):
@@ -353,17 +436,74 @@ def _read_identity(dap, chip=None):
     return SCU_CHIPID, None
 
 
-def _unlock_if_locked(dap, args, chip=None, halt=False):
+def _unlock_if_locked(dap, args, chip=None, halt=False, confirm=False, spans=None):
     """Read the identity register; if the part is debug-locked, unlock with
-    --debug-unlock-pw; optionally halt CPU0 at reset (halt=True); then disable
-    flash protection if asked. -> (id_addr, id_value). Raises Fail (locked=True
-    when no password was given)."""
-    was_locked = _locked(_read_identity(dap, chip)[1])
-    addr, chipid = _debug_unlock(dap, args, chip)
+    --debug-unlock-pw; with confirm=True refuse unless the silicon's family
+    matches the chip, and unless every (lo, hi) in `spans` lies in the memory
+    map of this exact variant; optionally halt CPU0 at reset (halt=True); then
+    disable flash protection if asked. -> (id_addr, id_value). Raises Fail
+    (locked=True when no password was given)."""
+    identity = _read_identity(dap, chip)
+    addr, chipid = _debug_unlock(dap, args, chip, identity)
+    if confirm:
+        _confirm_family(chip, addr, chipid)
+        if spans:
+            _confirm_variant(chip.for_identity(addr, chipid), spans)
     if halt:
-        _halt_cpu(dap, chip, was_locked)
+        _halt_cpu(dap, chip, _locked(identity[1]))
     _disable_flash_protection(dap, args, chip)
     return addr, chipid
+
+
+def _detected_family(id_addr, chipid):
+    """The generation of the connected silicon from its identity register:
+    SCU_CHIPID.CHTEC (01 TC2xx, 10 TC3xx), or the family whose own identity
+    register answered (TC4xx has no SCU_CHIPID). None if it cannot tell."""
+    if id_addr == SCU_CHIPID:
+        return {1: "tc2xx", 2: "tc3xx"}.get((chipid >> 6) & 3)
+    families = {chip.family for chip in all_chips() if chip.id_addr == id_addr}
+    return families.pop() if len(families) == 1 else None
+
+
+def _confirm_family(chip, id_addr, chipid):
+    """Refuse to drive the flash unless the connected silicon is the family -c
+    or --device names: the flash register map differs per family."""
+    detected = _detected_family(id_addr, chipid)
+    if detected is None:
+        raise Fail("cannot tell the connected part's family (identity 0x%08X at 0x%08X); "
+                   "the flash registers differ per family" % (chipid, id_addr), EX_REFUSED)
+    if detected != chip.family:
+        raise Fail("the connected part is %s but %s is %s; the flash registers differ per "
+                   "family" % (detected, chip.name, chip.family), EX_REFUSED)
+
+
+def _confirm_variant(variant, spans):
+    """Refuse unless every (lo, hi) span lies in one address range of the
+    connected variant's memory map (a reduced-flash part has less PFLASH than
+    its family entry)."""
+    for lo, hi in spans:
+        inside = any(r.base <= lo and hi <= r.end for r in variant.memory)
+        if variant.pflash_unknown is not None and variant.kind_at(lo) == "pflash":
+            raise Fail("this %s variant has %d KiB PFLASH and the device file has no "
+                       "layout for that size"
+                       % (variant.name, variant.pflash_unknown // 1024), EX_REFUSED)
+        if not inside:
+            raise Fail("0x%08X..0x%08X is outside the memory map of this %s variant"
+                       % (lo, hi, variant.name), EX_REFUSED)
+
+
+def _check_supported(chip, what):
+    """Raise Fail unless tcprog drives this chip's flash (the TC3xx/TC4xx DMU)
+    and its device map agrees with the flash profile about the UCBs. TC2xx keeps
+    flash status in its FLASH0 module, and a device file without a known family
+    names no register map."""
+    if not drives(chip.family):
+        raise Fail("%s is not supported on %s (family %s); tcprog drives the "
+                   "TC3xx/TC4xx flash controller only" % (what, chip.name, chip.family),
+                   os.EX_UNAVAILABLE)
+    problem = device_map_problem(chip)
+    if problem:
+        raise Fail("%s: %s" % (chip.name, problem), EX_REFUSED)
 
 
 def _halt_cpu(dap, chip, was_locked):
@@ -371,14 +511,13 @@ def _halt_cpu(dap, chip, was_locked):
     has started, so reset with Halt-After-Reset and keep CPU0 at its first
     instruction during the flash operation."""
     if was_locked:
-        log("tcprog: warning - not halting CPU0: the part was debug-locked and a "
-            "halt-after-reset would lock it again; PFLASH program/erase may be "
-            "refused while the application runs")
+        warn("not halting CPU0: the part was debug-locked and a halt-after-reset would lock "
+             "it again; PFLASH program/erase may be refused while the application runs")
         return
     pc = dap.halt_after_reset()
     if pc is None:
-        log("tcprog: warning - could not halt CPU0 at reset; PFLASH program/erase "
-            "may be refused while the application runs")
+        warn("could not halt CPU0 at reset; PFLASH program/erase may be refused while the "
+             "application runs")
     else:
         log("tcprog: CPU0 halted at reset (PC 0x%08X)" % pc, verbose=True)
     return pc
@@ -387,12 +526,12 @@ def _halt_cpu(dap, chip, was_locked):
 def _after(dap, args, halted):
     """--after: reset (default) restarts the application; no-reset / halt leave
     CPU0 halted."""
-    if halted and getattr(args, "after", "reset") == "reset":
+    if halted and args.after == "reset":
         try:
             dap.pulse_reset(0.010, 0.0)
         except DapError as error:
-            log("tcprog: warning - could not reset the target afterwards (%s); "
-                "CPU0 may still be halted, reset or power-cycle it" % error)
+            warn("could not reset the target afterwards (%s); CPU0 may still be halted, reset "
+                 "or power-cycle it" % error)
             return
         log("tcprog: reset, application restarted", verbose=True)
 
@@ -407,22 +546,22 @@ def _disable_flash_protection(dap, args, chip):
     if not wanted:
         return
     if chip is None:
-        raise Fail("flash unlock needs the target: pass -c/--chip", os.EX_USAGE)
-    if chip.family not in ("tc3xx", "tc4xx"):
+        raise Fail("flash unlock needs the target; pass -c/--chip", os.EX_USAGE)
+    if not drives(chip.family):
         raise Fail("flash unlock is not supported on %s yet" % chip.family,
                    os.EX_UNAVAILABLE)
-    flash = Flash(dap, chip.family)
+    flash = Flash(dap, chip)
     done = set()
     for which, value in wanted:
         text = value or args.debug_unlock_pw
         if not text:
-            raise Fail("--%s-unlock-pw needs a value (no --debug-unlock-pw to reuse)"
+            raise Fail("--%s-unlock-pw needs a value; there is no --debug-unlock-pw to reuse"
                        % which, os.EX_USAGE)
         try:
             words = parse_password(text)
         except ValueError as error:
             raise Fail(str(error), os.EX_USAGE)
-        key = flash.p.unprotect[which]
+        key = flash.p.dp_selector[which]
         if key in done:
             continue
         try:
@@ -430,29 +569,29 @@ def _disable_flash_protection(dap, args, chip):
         except DapError as error:
             raise Fail(str(error), os.EX_NOPERM)
         done.add(key)
-        log("tcprog: %s protection %s" % (which.upper(), "was already disabled"
-                                          if already else "disabled"), verbose=True)
+        if not already:
+            log("tcprog: %s protection disabled" % which.upper(), verbose=True)
 
 
-def _debug_unlock(dap, args, chip=None):
-    addr, chipid = _read_identity(dap, chip)
+def _debug_unlock(dap, args, chip, identity):
+    """Unlock the debug interface if the identity read (addr, value) shows it is
+    locked. -> (id_addr, id_value) as read after the unlock."""
+    addr, chipid = identity
     if not _locked(chipid):
         return addr, chipid
     if chip is not None and chip.family == "tc4xx":
-        raise Fail("locked; TC4xx debug unlock is not implemented yet (same key "
-                   "exchange as TC3xx, untested on a locked part)", os.EX_NOPERM,
+        raise Fail("debug-locked; debug unlock is not supported on TC4xx", os.EX_NOPERM,
                    locked=not args.debug_unlock_pw)
     if not args.debug_unlock_pw:
-        raise Fail("locked (DBGIFLCK); pass --debug-unlock-pw to unlock",
+        raise Fail("debug-locked (DBGIFLCK); pass --debug-unlock-pw to unlock",
                    os.EX_NOPERM, locked=True)
     try:
         words = parse_password(args.debug_unlock_pw)
     except ValueError as error:
         raise Fail(str(error), os.EX_USAGE)
     if not args.quiet:
-        sys.stderr.write("tcprog: locked, trying debug unlock (up to %d attempts)...\n"
-                         % args.unlock_tries)
-    ok, chipid, tries = dap.unlock(words, args.unlock_tries, on_attempt=_attempt_logger())
+        log("tcprog: debug-locked, trying debug unlock (up to %d attempts)" % args.unlock_tries)
+    ok, chipid, tries = dap.unlock(words, args.unlock_tries, on_attempt=_log_attempt)
     if not ok:
         raise Fail(_unlock_failed_msg(dap, tries), os.EX_NOPERM)
     log("tcprog: unlocked after %d attempt%s" % (tries, "" if tries == 1 else "s"), verbose=True)
@@ -463,8 +602,6 @@ def _debug_unlock(dap, args, chip=None):
 # ident
 # ======================================================================
 def _cmd_ident(args):
-    if args.transport != "dap":
-        return _todo("ident over %s" % args.transport)
 
     chip, error = _resolve_chip(args)   # fail fast on a bad --device/--chip
     if error:
@@ -472,10 +609,7 @@ def _cmd_ident(args):
 
     vid, pid, serial = parse_probe(args.probe)
     probe_label = "dap %04x:%04x%s" % (vid, pid, ":" + serial if serial else "")
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
+    dap = _open_dap(args)
 
     with dap:
         try:
@@ -483,39 +617,43 @@ def _cmd_ident(args):
         except Fail as f:
             if f.locked:
                 # Link is up but identity is unreadable: present and debug-locked.
-                # Report that (do not just error) so a probe-only run is useful.
+                # Reported as such, rather than as a bare error, so a probe-only
+                # run is still useful.
                 if args.json:
-                    print(json.dumps({"chip": None, "debugInterfaceLocked": True}))
+                    print(json.dumps({"chip": None, "debug_interface_locked": True}))
                 elif not args.quiet:
                     print("target (%s):" % probe_label)
                     print("  %-11s %s" % ("chip", "locked (identity unreadable)"))
-                return _error("target present but debug-locked (DBGIFLCK); "
-                             "pass --debug-unlock-pw to identify.", f.code)
-            return _error(f, f.code)
+                return _error("target present but debug-locked (DBGIFLCK); pass "
+                             "--debug-unlock-pw to identify it", f.code)
+            raise
 
         if chip is None:
-            chip = by_chipid(chipid, id_addr)
+            chip = _detected(id_addr, chipid)
+        else:
+            chip = chip.for_identity(id_addr, chipid)
         jtag = id_addr != SCU_CHIPID
         fields = _decode_jtagid(chipid) if jtag else _decode_chipid(chipid)
         step = fields["version"] if jtag else fields["chrev"]
         hsm = None if jtag else bool(fields["sec"])
-        pf_kib = (chip.first("pflash").size // 1024) if chip and chip.first("pflash") else None
+        pf_kib = (sum(b.size for b in chip.noncached_ranges("pflash")) // 1024 or None) if chip else None
         df_kib = (chip.first("dflash").size // 1024) if chip and chip.first("dflash") else None
 
         if args.json:
             part = next((alias for alias in chip.aliases if alias.startswith("sak")),
                         None) if chip else None
             print(json.dumps({
+                "tcprog": VERSION,
                 "chip": {
                     "id": "0x%08X" % chipid,
                     "name": chip.name if chip else None,
-                    "partNumber": part,
+                    "part_number": part,
                     "family": chip.family if chip else None,
-                    "idRegister": "JTAGID" if jtag else "CHIPID",
+                    "id_register": "JTAGID" if jtag else "CHIPID",
                     "step": "0x%02X" % step,
                 },
-                "pflashKiB": pf_kib,
-                "dflashKiB": df_kib,
+                "pflash_kib": pf_kib,
+                "dflash_kib": df_kib,
                 "hsm": hsm,
             }))
         else:
@@ -533,7 +671,7 @@ def _cmd_ident(args):
             if jtag:
                 show("part", "part", "0x%04X" % fields["part"])
             show("step", "step", "0x%02X" % step)
-            show("hsm", "hsm", "?" if hsm is None else "%s" % hsm)
+            show("hsm", "hsm", "n/a" if jtag else "%s" % hsm)    # TC4xx: CSRM, not in the JTAG ID
             show("pflash", "pflash", "%s KiB" % pf_kib if pf_kib else "?")
             show("dflash", "dflash", "%s KiB" % df_kib if df_kib else "?")
 
@@ -542,7 +680,7 @@ def _cmd_ident(args):
             expected = args.check.strip().lower()
             matched = chip is not None and (expected == chip.name or expected in chip.aliases)
             if not matched:
-                return _error("ident --check mismatch: detected %s, expected %s"
+                return _error("ident --check: detected %s, expected %s"
                              % (detected, args.check), EX_CHECK)
     return os.EX_OK
 
@@ -550,65 +688,86 @@ def _cmd_ident(args):
 # ======================================================================
 # ucb
 # ======================================================================
+def _image_payload(segments, fmt, start, end, quiet=False):
+    """[(addr, bytes)] as the bytes of a bin, srec or hex file. A bin file is
+    one flat run from start to end: what no segment covers is 0x00, with a
+    warning naming how much."""
+    if fmt == "bin":
+        data, gaps = flat_binary(segments, start, end)
+        if gaps and not quiet:
+            warn("the bin file (0x%08X..0x%08X) has %s in %d gap(s) filled with 0x00"
+                 % (start, end, _size(sum(hi - lo for lo, hi in gaps)), len(gaps)))
+        return data
+    binfile = bincopy.BinFile()
+    for addr, data in segments:
+        binfile.add_binary(bytes(data), address=addr)
+    return (binfile.as_ihex() if fmt == "hex" else binfile.as_srec()).encode()
+
+
 def _export_bmhds(dap, chip, args):
-    """Read the raw BMHD blocks (header, password, confirmation) to -o."""
+    """Read the raw BMHD blocks (header, password, confirmation) to -o. A bin
+    file fills the gaps between blocks (TC3xx ORIG and COPY) with 0x00."""
     if not args.output:
         raise Fail("ucb export needs -o FILE", os.EX_USAGE)
     fmt = args.format or _out_format(args.output)
     blocks = bmhd_blocks(chip)
-    for (_n, addr, size), (_m, nxt, _s) in zip(blocks, blocks[1:]):
-        if addr + size != nxt:
-            raise Fail("BMHD blocks are not contiguous; export does not handle gaps",
-                       os.EX_SOFTWARE)
-    data = b""
+    segments = []
     for name, addr, size in blocks:
         log("tcprog: reading %s @ 0x%08X (%d bytes)" % (name, addr, size), verbose=True)
-        data += read_words(dap, addr, size)
+        segments.append((addr, read_words(dap, addr, size)))
+    payload = _image_payload(segments, fmt, min(addr for addr, _ in segments),
+                             max(addr + len(data) for addr, data in segments), args.quiet)
     try:
         with open(args.output, "wb") as handle:
-            handle.write(_emit(data, blocks[0][1], fmt))
+            handle.write(payload)
     except OSError as error:
         raise Fail(error, os.EX_CANTCREAT)
-    if not args.quiet:
-        log("tcprog: exported %d BMHD block(s), 0x%08X..0x%08X (%d bytes, %s) -> %s"
-            % (len(blocks), blocks[0][1], blocks[0][1] + len(data), len(data), fmt,
-               args.output))
+    log("tcprog: exported %d BMHD block(s) (%s) -> %s"
+        % (len(blocks), ", ".join("%s 0x%08X" % (name, addr) for name, addr, _ in blocks),
+           args.output), verbose=True)
     return os.EX_OK
 
 
+def _confirm_json(state, word):
+    """One confirmation code for --json: {"state": token, "word": "0x..." or None}.
+    Tokens: unlocked, confirmed, errored, erased, unknown, read_protected,
+    unreadable. None where the UCB has no such code."""
+    if state is None:
+        return None
+    token = state.split(" ")[0].lower().replace("-", "_")
+    return {"state": "unknown" if token.startswith("0x") else token,
+            "word": None if word is None else "0x%08X" % word}
+
+
 def _cmd_ucb(args):
-    if args.transport != "dap":
-        return _todo("ucb over %s" % args.transport)
-    action = args.action or "decode"
+    action = args.action
     chip, error = _resolve_chip(args)
     if error:
         return _error(error, os.EX_USAGE)
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
+    dap = _open_dap(args)
     with dap:
-        try:
-            id_addr, chipid = _unlock_if_locked(dap, args, chip)
-            if chip is None:
-                chip = by_chipid(chipid, id_addr)
-            if chip is None:
-                raise Fail("unknown target; pass -c/--chip or --device", os.EX_USAGE)
-            if action == "export":
-                return _export_bmhds(dap, chip, args)
-            ucbs = _read_ucbs(dap, chip)
-            boot = next_boot_report(dap, chip)
-        except Fail as f:
-            return _error(f, f.code)
+        id_addr, chipid = _unlock_if_locked(dap, args, chip)
+        if chip is None:
+            chip = _detected(id_addr, chipid)
+        if chip is None:
+            raise Fail("unknown target; pass -c/--chip or --device", os.EX_USAGE)
+        if action == "export":
+            return _export_bmhds(dap, chip, args)
+        ucbs = _read_ucbs(dap, chip)
+        boot = next_boot_report(dap, chip)
 
         if args.json:
             print(json.dumps([{"name": u["name"], "addr": "0x%08X" % u["addr"],
-                               "state": u["state"],
+                               "orig": _confirm_json(u["orig"], u["orig_word"]),
+                               "copy": _confirm_json(u["copy"], u["copy_word"]),
+                               "in_use": u["source"],
                                "bmhd": None if u["bmhd"] is None else
                                {"bmi": "0x%04X" % u["bmhd"]["bmi"],
                                 "hwcfg": u["bmhd"].get("hwcfg"),
-                                "stad": "0x%08X" % u["bmhd"].get("stad", u["bmhd"].get("stadbm")),
-                                "valid": u["bmhd_ok"]}} for u in ucbs]))
+                                "stad": "0x%08X" % u["bmhd"]["stad"],
+                                "valid": u["bmhd_ok"], "boot": bool(u.get("boot"))},
+                               "problems": u.get("problems", []),
+                               "warnings": u.get("warnings", [])} for u in ucbs]))
         elif action == "decode":
             print("UCBs (%s):" % chip.name)
             for u in ucbs:
@@ -616,508 +775,523 @@ def _cmd_ucb(args):
                 if u["bmhd"] is not None:
                     b = u["bmhd"]
                     mode = ("hwcfg=0x%X" % b["hwcfg"]) if "hwcfg" in b else ("bmi=0x%04X" % b["bmi"])
-                    print("          BMHD %s stad=0x%08X crc=%s"
-                          % (mode, b.get("stad", b.get("stadbm")), "ok" if u["bmhd_ok"] else "BAD"))
+                    print("          BMHD %s stad=0x%08X crc=%s%s"
+                          % (mode, b["stad"], "ok" if u["bmhd_ok"] else "BAD",
+                             "  <- boots from this header" if u.get("boot") else ""))
                     for problem in u["bmhd_problems"]:
                         print("          ! %s" % problem)
+                for message in u.get("problems", []) + u.get("warnings", []):
+                    print("          ! %s" % message)
             if boot:
-                print("Next boot:")
+                print("Next boot validation:")
                 for level, message in boot:
                     print("  %-7s %s" % (level.upper(), message))
 
         if action == "verify":
-            problems = ["next boot: %s" % m for level, m in boot if level == "lockout"]
+            problems = ["next boot validation: %s" % m for level, m in boot if level == "lockout"]
             for u in ucbs:
-                if u["confirm"] is not None and u["confirm"] not in _CONFIRM:
+                if "problems" in u:
+                    # TC3xx: judged per ORIG/COPY pair; only the BMHD that
+                    # boots has to be valid.
+                    problems += u["problems"]
+                    for warning in u["warnings"]:
+                        warn(warning)
+                    continue
+                if u["confirm"] is not None and confirm_unknown(u["confirm"]):
                     problems.append("%s confirm word 0x%08X unrecognized"
                                     % (u["name"], u["confirm"]))
                 if u["bmhd"] is not None and not u["bmhd_ok"]:
                     problems.append("%s: %s" % (u["name"], "; ".join(u["bmhd_problems"])))
             if problems:
                 for p in problems:
-                    log("tcprog: %s" % p)
-                return _error("%d UCB problem(s)" % len(problems), EX_VERIFY)
-            if not args.quiet:
-                log("tcprog: UCBs OK")
+                    _error(p, EX_VERIFY)
+                return _error("ucb verify found %d problem(s)" % len(problems), EX_VERIFY)
+            log("tcprog: UCBs OK", verbose=True)
     return os.EX_OK
 
 
 # ======================================================================
 # read
 # ======================================================================
+def _region_ranges(chip, regions):
+    """[(base, size)] of the named regions, sorted, adjacent or overlapping ones
+    merged. A name is an address range of the device file (dflash1, ucb, dspr0)
+    or a kind: pflash is every PFLASH bank, dflash is DFLASH0."""
+    spans = []
+    for region in regions:
+        found = ([r for r in chip.memory if r.name == region]
+                 or chip.noncached_ranges(region))
+        if not found:
+            known = [r.name for r in chip.memory]
+            known += [kind for kind in ("pflash", "dflash", "ucb") if kind not in known]
+            raise Fail("%s has no region %r (choose from %s)"
+                       % (chip.name, region, ", ".join(known)), os.EX_USAGE)
+        spans += [(r.base, r.end) for r in found]
+    ranges = []
+    for lo, hi in sorted(spans):
+        if ranges and lo <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(hi, ranges[-1][1]))
+        else:
+            ranges.append((lo, hi))
+    return [(lo, hi - lo) for lo, hi in ranges]
+
+
+def _range_label(chip, addr, length):
+    """`PFLASH 0xA0000000..0xA0600000`: the kind of memory and the range."""
+    kind = chip.kind_at(addr) if chip is not None else "?"
+    return "%s 0x%08X..0x%08X" % ("memory" if kind == "?" else kind.upper(), addr,
+                                  addr + length)
+
+
+def _read_range(dap, args, chip, addr, length):
+    """Read one address range. -> (segments, unreadable, missed_bytes): the
+    [(addr, bytes)] that were read, the (lo, hi) spans that are programmed but
+    unreadable, and the bytes a plain block scan could not read."""
+    where = _range_label(chip, addr, length)
+    show = args.progress and not args.quiet
+    start, end = _block_span(addr, length)
+    if not args.skip_blank:
+        # Exactly the requested range: reading past its end can hit erased
+        # flash, which fails the read ECC.
+        log("tcprog: %s: reading %s" % (where, _size(length)), verbose=True)
+        with Progress(where + ": read", (end - start) // 1024, " KiB", show) as reading:
+
+            def on_progress(position):
+                reading.update(-(-(position - start) // 1024))
+            data = _read_region(dap, addr, length, on_progress=on_progress)
+        return [(addr, data)], [], 0
+
+    # On TC3xx/TC4xx flash (PFLASH, DFLASH, UCBs), map occupancy with the
+    # hardware blank-check and read only the programmed pages. Elsewhere (TC2xx,
+    # RAM, CFS) keep the blocks that answer a plain read.
+    geometry = blankcheck_geometry(chip, addr, length)
+    if geometry is not None:
+        sectors = len(range(addr & ~(geometry[0] - 1), addr + length, geometry[0]))
+        log("tcprog: %s: blank-checking %d logical sector(s), then reading the programmed "
+            "pages" % (where, sectors), verbose=True)
+        # The read phase's size is known once the blank-check is done.
+        reading = []
+
+        def on_read(done, total):
+            if not reading:
+                progress.finish()
+                reading.append(Progress(where + ": read", -(-total // 1024), " KiB", show))
+            reading[0].update(-(-done // 1024))
+        with Progress(where + ": blank-check", sectors, " logical sectors", show) as progress:
+            try:
+                segments, unreadable = read_region_blankcheck(
+                    dap, addr, length, chip,
+                    on_map=lambda done, total: progress.update(done), on_read=on_read)
+            finally:
+                if reading:
+                    reading[0].finish()
+        return segments, unreadable, 0
+
+    log("tcprog: %s: reading, keeping the blocks that answer" % where, verbose=True)
+    with Progress(where + ": read", (end - start) // 1024, " KiB", show) as progress:
+        segments, missed = read_region_sparse(
+            dap, addr, length, on_progress=lambda done, total, kept: progress.update(done))
+    return segments, [], missed * Dap.BLOCK
+
+
+def _read_failed(chip, addr):
+    """Why a plain read stopped at addr, and what to do about it."""
+    kind = chip.kind_at(addr) if chip is not None else "?"
+    if kind == "pflash":
+        why = ("blank or unreadable PFLASH (blank PFLASH fails the ECC check); use "
+               "--skip-blank to read only the programmed data")
+    elif kind in ("dflash", "ucb"):
+        why = ("%s that is blank, unreadable or read-protected; use --skip-blank to read "
+               "only the programmed data" % kind.upper())
+    else:
+        why = "no answer from the target"
+    return "read failed at 0x%08X: %s" % (addr, why)
+
+
 def _cmd_read(args):
-    import time
-    if args.transport != "dap":
-        return _todo("read over %s" % args.transport)
 
     chip, error = _resolve_chip(args)
     if error:
         return _error(error, os.EX_USAGE)
 
-    # range: explicit --addr/--length, or a whole --region on a known chip
+    # ranges: explicit --addr/--length, or the whole --region(s) of the chip
+    # (named, or detected after connecting)
     addr, length = args.addr, args.length
-    if addr is None or length is None:
-        if args.region and chip:
-            seg = chip.first(args.region)
-            if seg is None:
-                return _error("%s has no %s region" % (chip.name, args.region), os.EX_USAGE)
-            addr = seg.base if addr is None else addr
-            length = seg.size if length is None else length
-        else:
-            return _error("read needs --addr and --length (or --region with -c/--chip)",
-                         os.EX_USAGE)
-    if length <= 0:
+    if (addr is None or length is None) and not args.region:
+        return _error("read needs --addr and --length, or --region", os.EX_USAGE)
+    if length is not None and length <= 0:
         return _error("--length must be positive", os.EX_USAGE)
     fmt = args.format or _out_format(args.output)
 
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
+    dap = _open_dap(args)
 
     with dap:
-        try:
-            id_addr, chipid = _unlock_if_locked(dap, args, chip)
-        except Fail as f:
-            return _error(f, f.code)
-
+        id_addr, chipid = _unlock_if_locked(dap, args, chip)
         if chip is None:
-            chip = by_chipid(chipid, id_addr)
-        if chip is not None and not args.quiet:
-            if not (chip.slice_of(addr) and chip.slice_of(addr + length - 1)):
-                sys.stderr.write("tcprog: warning - [0x%08X,0x%08X) is outside a known "
-                                 "memory slice; reading erased flash raises an ECC error "
-                                 "and can wedge the target.\n" % (addr, addr + length))
-
-        if args.skip_erased:
-            if fmt == "bin":
-                return _error("--skip-erased needs a sparse container; use "
-                              "--format srec or hex (bin cannot hold the gaps)",
-                              os.EX_USAGE)
-            total_kib = (((addr + length + Dap.BLOCK - 1) & ~(Dap.BLOCK - 1))
-                         - (addr & ~(Dap.BLOCK - 1))) // 1024
-
-            show = not args.quiet and not args.no_progress
-            scan = Progress("scan", total_kib, " KiB", show)
-
-            def progress(done, total, kept):
-                scan.update(done, "  kept %d KiB" % (kept // 1024))
-
-            # On TC3xx/TC4 PFLASH, map occupancy with the hardware blank-check and
-            # read only the programmed sectors - the erased bulk is never read,
-            # so there is no per-block reconnect over empty flash. Elsewhere
-            # (TC2xx, non-PFLASH) fall back to the plain block scan.
-            use_bc = (chip is not None and chip.family in ("tc3xx", "tc4xx")
-                      and _is_pflash(addr))
-            started = time.time()
-            try:
-                if use_bc:
-                    mapping = []
-
-                    def on_map(done, total):
-                        if not mapping:
-                            mapping.append(Progress("blank-check", total, " sectors", show))
-                        mapping[0].update(done)
-                    segments, missed, unreadable = read_region_blankcheck(
-                        dap, addr, length, on_map=on_map, family=chip.family)
-                    if mapping:
-                        mapping[0].finish()
-                else:
-                    segments, missed = read_region_sparse(
-                        dap, addr, length, on_progress=progress)
-                    unreadable = []
-            except DapError as error:
-                scan.finish()
-                sys.stderr.write("tcprog: sparse read failed: %s\n" % error)
-                return os.EX_IOERR
-            scan.finish()
-            elapsed = time.time() - started
-            data_len = sum(len(d) for _, d in segments)
+            chip = _detected(id_addr, chipid)
         else:
-            block_size = Dap.BLOCK
-            start = addr & ~(block_size - 1)
-            end = (addr + length + block_size - 1) & ~(block_size - 1)
-            block_addrs = list(range(start, end, block_size))
-            buffer, group_size = bytearray(), 16
-            started = time.time()
-            reading = Progress("read", (end - start) // 1024, " KiB",
-                               not args.quiet and not args.no_progress)
-            try:
-                for index in range(0, len(block_addrs), group_size):
-                    buffer += dap.read_blocks(block_addrs[index:index + group_size])
-                    reading.update(len(buffer) // 1024)
-            except DapError as error:
-                reading.finish()
-                sys.stderr.write("tcprog: read failed near 0x%08X: %s\n"
-                                 % (start + len(buffer), error))
-                return os.EX_IOERR
-            reading.finish()
-            elapsed = time.time() - started
-            data = bytes(buffer[addr - start: addr - start + length])
+            chip = chip.for_identity(id_addr, chipid)
+        if addr is None or length is None:
+            if chip is None:
+                raise Fail("cannot detect the connected part for --region; pass -c/--chip",
+                           os.EX_USAGE)
+            ranges = _region_ranges(chip, args.region)
+            if addr is not None or length is not None:
+                if len(ranges) > 1:
+                    raise Fail("--addr/--length with --region needs a region of one "
+                               "address range", os.EX_USAGE)
+                ranges = [(ranges[0][0] if addr is None else addr,
+                           ranges[0][1] if length is None else length)]
+        else:
+            ranges = [(addr, length)]
+        if chip is not None and not args.quiet:
+            for base, size in ranges:
+                if not (chip.range_at(base) and chip.range_at(base + size - 1)):
+                    warn("0x%08X..0x%08X is outside a known address range; reading there "
+                         "can fail or wedge the target" % (base, base + size))
+        if args.skip_blank and any(blankcheck_geometry(chip, base, size)
+                                    for base, size in ranges):
+            # The blank-check drives the flash controller: confirm the family.
+            _confirm_family(chip, id_addr, chipid)
 
-    if args.skip_erased:
-        binfile = bincopy.BinFile()
-        for seg_addr, seg_data in segments:
-            binfile.add_binary(seg_data, address=seg_addr)
-        payload = (binfile.as_ihex() if fmt == "hex" else binfile.as_srec())
-        if args.output:
+        results = []
+        started = time.time()
+        for base, size in ranges:
             try:
-                with open(args.output, "w") as handle:
+                results.append(_read_range(dap, args, chip, base, size))
+            except ReadFailed as error:
+                return _error(_read_failed(chip, error.addr), os.EX_IOERR)
+            except DapError as error:
+                return _error("read failed: %s" % error, os.EX_IOERR)
+        elapsed = time.time() - started
+
+    segments = [segment for result in results for segment in result[0]]
+    data_len = sum(len(data) for _, data in segments)
+    if not args.output and fmt == "bin":
+        for seg_addr, seg_data in segments:
+            _hexdump(seg_data, seg_addr)
+    else:
+        payload = _image_payload(segments, fmt, ranges[0][0], sum(ranges[-1]), args.quiet)
+        if not args.output:
+            sys.stdout.write(payload.decode())
+        else:
+            try:
+                with open(args.output, "wb") as handle:
                     handle.write(payload)
             except OSError as error:
                 return _error(error, os.EX_CANTCREAT)
-        else:
-            for seg_addr, seg_data in segments:
-                _hexdump(seg_data, seg_addr)
-        throughput = (data_len / 1024.0) / elapsed if elapsed > 0 else 0.0
-        if not args.quiet:
-            for seg_addr, seg_data in segments:
-                sys.stderr.write("  segment 0x%08X .. 0x%08X (%d KiB)\n"
-                                 % (seg_addr, seg_addr + len(seg_data), len(seg_data) // 1024))
-            sys.stderr.write("tcprog: sparse read of [0x%08X,0x%08X): %d KiB kept in "
-                             "%d segment(s), %d block(s) erased (%.1f KiB/s)%s\n"
-                             % (addr, addr + length, data_len // 1024, len(segments),
-                                missed, throughput,
-                                " -> " + args.output if args.output else ""))
-            for lo, hi in unreadable:
-                sys.stderr.write("tcprog: warning - 0x%08X..0x%08X blank-checks as "
-                                 "programmed but did not read back (uncorrectable ECC?); "
-                                 "omitted from the image\n" % (lo, hi))
-        return os.EX_OK
 
-    try:
-        payload = _emit(data, addr, fmt)
-    except (ImportError, ValueError) as error:
-        return _error(error, os.EX_DATAERR)
-
-    if args.output:
-        mode = "wb" if isinstance(payload, bytes) else "w"
-        try:
-            with open(args.output, mode) as handle:
-                handle.write(payload)
-        except OSError as error:
-            return _error(error, os.EX_CANTCREAT)
-    elif fmt == "bin":
-        _hexdump(data, addr)
-    else:
-        sys.stdout.write(payload.decode() if isinstance(payload, bytes) else payload)
-
-    throughput = (len(data) / 1024.0) / elapsed if elapsed > 0 else 0.0
+    throughput = (data_len / 1024.0) / elapsed if elapsed > 0 else 0.0
+    unreadable = [span for result in results for span in result[1]]
+    missed = sum(result[2] for result in results)
+    # On TC2xx (no flash driver) a block that fails the scan is blank or
+    # unreadable. On TC3xx/TC4xx the scan covers only ranges without a
+    # blank-check (RAM, CFS), so a failed block there is unreadable.
+    missed_kind = ("unreadable" if chip is not None and drives(chip.family)
+                   else "blank or unreadable")
     if args.json:
         print(json.dumps({"chip": chip.name if chip else "unknown",
-                          "addr": "0x%08X" % addr, "length": len(data),
+                          "ranges": [{"addr": "0x%08X" % base, "length": size}
+                                     for base, size in ranges],
+                          "segments": len(segments), "length": data_len,
+                          "unreadable": sum(hi - lo for lo, hi in unreadable)
+                          + (missed if chip is not None and drives(chip.family) else 0),
                           "format": fmt, "output": args.output or "-",
                           "kib_per_s": round(throughput, 1)}))
     elif not args.quiet:
-        sys.stderr.write("tcprog: read %d bytes from 0x%08X (%.1f KiB/s)%s\n"
-                         % (len(data), addr, throughput,
-                            " -> " + args.output if args.output else ""))
+        # Success is silent; the report comes with -v. Data missing from the
+        # image is always reported.
+        lines = []
+        for (base, size), (got, bad, _) in zip(ranges if args.skip_blank else [], results):
+            lines.append("tcprog: %s (%s)" % (_range_label(chip, base, size), _size(size)))
+            rows = [("segment", lo, len(data)) for lo, data in got]
+            rows += [("unreadable", lo, hi - lo) for lo, hi in bad]
+            for name, lo, n in sorted(rows, key=lambda row: row[1]):
+                lines.append("  %-10s  0x%08X..0x%08X  %8s" % (name, lo, lo + n, _size(n)))
+            if not rows:
+                lines.append("  blank")
+        summary = "tcprog: read %s" % _size(data_len)
+        if args.skip_blank:
+            summary += " in %d segment(s)" % len(segments)
+        summary += " at %.1f KiB/s" % throughput
+        bad = sum(hi - lo for lo, hi in unreadable)
+        if missed and missed_kind == "unreadable":
+            bad += missed
+        if bad:
+            summary += ", %s unreadable" % _size(bad)
+        if args.output:
+            summary += " -> %s" % args.output
+        lines.append(summary)
+        log("\n".join(lines), verbose=True)
+    if not args.quiet:
+        for lo, hi in unreadable:
+            warn("0x%08X..0x%08X (%s) is programmed but unreadable; not in the image"
+                 % (lo, hi, _size(hi - lo)))
+        if missed:
+            warn("%s %s; not in the image" % (_size(missed), missed_kind))
     return os.EX_OK
 
 
 # ======================================================================
 # write / erase
 # ======================================================================
+def _confirm_or_abort(lines):
+    """Show the plan and ask before touching flash. Raises Fail unless the
+    answer is yes."""
+    sys.stderr.write("\n".join(lines) + "\n")
+    try:
+        if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise Fail("not confirmed; nothing was changed", EX_REFUSED)
+    except EOFError:
+        raise Fail("no terminal to confirm on; pass -y/--yes", EX_REFUSED)
+
+
+def _size(n):
+    """A byte count for reports: 256 B, 27 KiB, 1.5 KiB."""
+    if n < 1024:
+        return "%d B" % n
+    return ("%d KiB" % (n // 1024)) if not n % 1024 else ("%.1f KiB" % (n / 1024.0))
+
+
+def _detected(id_addr, chipid, verbose=True):
+    """The database entry for the connected part, as its identity register
+    describes it (reduced-flash variant included), logged. -> Chip or None."""
+    chip = by_id(chipid, id_addr)
+    if chip is not None:
+        chip = chip.for_identity(id_addr, chipid)
+        log("tcprog: detected %s (%s 0x%08X, PFLASH %d KiB)"
+            % (chip.name, "CHIPID" if id_addr == SCU_CHIPID else "JTAGID", chipid,
+               sum(r.size for r in chip.noncached_ranges("pflash")) // 1024),
+            verbose=verbose)
+    return chip
+
+
+def _detect_chip(dap, args):
+    """-c auto: identify the connected part (unlocking debug if needed). Raises
+    Fail if the database does not recognise it."""
+    id_addr, chipid = _debug_unlock(dap, args, None, _read_identity(dap))
+    chip = _detected(id_addr, chipid, verbose=False)
+    if chip is None:
+        raise Fail("cannot detect the connected part (identity 0x%08X at 0x%08X); pass "
+                   "-c/--chip" % (chipid, id_addr), os.EX_USAGE)
+    return chip
+
+
+def _write_plan(chip, image, args):
+    """The checks of a write, in order: family and device map, allowlist, UCB
+    gate, erase plan, write- and erase-protected ranges; then the confirmation prompt.
+    -> erase plan. Raises Fail."""
+    _check_supported(chip, "write")
+
+    # ALLOWLIST: every segment must sit inside one of the device's address ranges.
+    # A custom --device file with only the permitted ranges thus confines a write
+    # to those regions and refuses anything else.
+    outside = [segment for segment in image.segments
+               if not any(region.base <= segment.addr and segment.end <= region.end
+                          for region in chip.memory)]
+    if outside:
+        raise Fail("%d segment(s) fall outside %s's memory map (%s)"
+                   % (len(outside), chip.name,
+                      ", ".join("0x%08X..0x%08X" % (s.addr, s.end) for s in outside)),
+                   EX_REFUSED)
+
+    # SAFETY GATE: refuse writes that touch any UCB region unless enabled.
+    ucb_segments = [s for s in image.segments if chip.kind_at(s.addr) == "ucb"]
+    if ucb_segments and not args.enable_ucb_write:
+        raise Fail("the image writes to the UCB region (%s) and --enable-ucb-write is not "
+                   "set; a wrong UCB can lock you out of the part or stop it booting"
+                   % ", ".join("0x%08X" % s.addr for s in ucb_segments), EX_REFUSED)
+
+    # Every segment must be flash; the erase is planned before anything is
+    # erased, so a bad segment is refused first.
+    try:
+        plan = erase_plan(chip, image)
+    except ValueError as error:
+        raise Fail(str(error), EX_REFUSED)
+
+    # PROTECTED: no segment, and no sector the write erases, may overlap a
+    # write-protected range. A sector the write erases in an erase-protected
+    # range must be filled completely by the image, so none of it is left
+    # erased. No option lifts this.
+    spans = [(segment.addr, segment.end) for segment in image.segments]
+    if args.erase == "sectors":
+        spans += [(first, first + count * size) for first, count, size in plan]
+    _refuse_protected(chip, spans, "write_protected")
+    if args.erase == "sectors":
+        for first, count, size in plan:
+            for lo in range(first, first + count * size, size):
+                hi = lo + size
+                region = chip.protected_at(lo, hi, "erase_protected")
+                filled = sum(max(0, min(hi, s.end) - max(lo, s.addr)) for s in image.segments)
+                if region is not None and filled < size:
+                    raise Fail("the image fills %s of the sector 0x%08X..0x%08X; "
+                               "the rest would be left erased in the erase-protected range %s"
+                               % (_size(filled), lo, hi, region.name), EX_REFUSED)
+
+    if not args.yes:
+        span_lo, span_hi = image.span
+        lines = ["tcprog: write to %s" % chip.name,
+                 "  range     0x%08X..0x%08X  %d B in %d segment(s)"
+                 % (span_lo, span_hi, image.total_bytes, len(image.segments)),
+                 "  regions   %s" % _regions_label(chip, image.segments),
+                 "  erase     %s" % ("%d sector(s) first" % sum(count for _, count, _ in plan)
+                                     if args.erase == "sectors" else "none"),
+                 "  WARNING   flash is erased and rewritten; this cannot be undone"]
+        if ucb_segments:
+            lines.append("  WARNING   UCB write: applies at the next reset; check `tcprog ucb` first")
+        _confirm_or_abort(lines)
+    return plan
+
+
 def _cmd_write(args):
-    if args.transport != "dap":
-        return _todo("write over %s" % args.transport)
     if not args.firmware:
-        return _error("no firmware image given (see `tcprog write --help`)", os.EX_USAGE)
-    chip, error = _resolve_chip(args)
+        return _error("no firmware image given; see `tcprog write --help`", os.EX_USAGE)
+    auto = (args.chip or "").lower() == "auto" and not args.device
+    chip, error = (None, None) if auto else _resolve_chip(args)
     if error:
         return _error(error, os.EX_USAGE)
-    # A write is gated on the target's memory map, so the part must be known up
-    # front - tcprog does not guess region boundaries for a destructive op.
-    if chip is None:
-        return _error("write requires the target: pass -c/--chip (e.g. -c tc375) "
-                      "or --device FILE", os.EX_USAGE)
+    # A write is gated on the target's memory map, so the part is named up front,
+    # or detected (-c auto) before anything is planned or written.
+    if chip is None and not auto:
+        return _error("write needs the target; pass -c/--chip (e.g. -c tc375, or -c auto "
+                      "to detect it) or --device FILE", os.EX_USAGE)
     try:
         image = load_image(args.firmware, fmt=args.format, address=args.address)
     except (ValueError, OSError) as error:
         return _error(error, os.EX_DATAERR)
 
     if args.dry_run:
+        if auto:
+            return _error("--dry-run does not connect; it needs a chip name, not -c auto",
+                          os.EX_USAGE)
         return _dry_run_plan(image, args, chip)
 
-    # TC2xx flash protection and status live in the FLASH0 module, not the DMU
-    # this driver polls; programming it with the TC3xx profile would fail mid-way.
-    if chip.family == "tc2xx":
-        return _error("write is not supported on TC2xx yet (FLASH0 status registers "
-                      "differ from the TC3xx/TC4xx DMU)", os.EX_UNAVAILABLE)
-
-    # ALLOWLIST: every segment must sit inside one of the device's memory slices.
-    # A custom --device file with only the permitted slices thus confines a write
-    # to those regions and refuses anything else.
-    outside = [segment for segment in image.segments
-               if not any(region.base <= segment.addr and segment.end <= region.end
-                          for region in chip.memory)]
-    if outside:
-        return _error("REFUSED - %d segment(s) fall outside %s's memory slices (%s). "
-                     "Not writing outside the device map."
-                     % (len(outside), chip.name,
-                        ", ".join("0x%08X..0x%08X" % (s.addr, s.end) for s in outside)),
-                     EX_REFUSED)
-
-    # SAFETY GATE: refuse writes that touch any UCB region unless enabled.
-    ucb_segments = [s for s in image.segments if chip.region_of(s.addr) == "ucb"]
-    if ucb_segments and not args.enable_ucb_write:
-        return _error("REFUSED - image writes to the UCB region (%s) and --enable-ucb-write "
-                     "is not set. A wrong UCB can lock you out of the part or brick it."
-                     % ", ".join("0x%08X" % s.addr for s in ucb_segments), EX_REFUSED)
-
-    # Confirm before touching flash (destructive, irreversible).
-    if not args.yes:
-        span_lo, span_hi = image.span
-        fam = chip.family if chip.family == "tc4xx" else "tc3xx"
-        p = profile_for_family(fam)
-        sectors = set()
-        for seg in image.segments:
-            size = _sector_size(seg.addr, p)
-            if size:
-                first, count = _flash_sectors(seg.addr, len(seg.data), size)
-                sectors.update(first + k * size for k in range(count))
-        lines = ["tcprog: write to %s" % chip.name,
-                 "  range     0x%08X..0x%08X  %d B in %d segment(s)"
-                 % (span_lo, span_hi, image.total_bytes, len(image.segments)),
-                 "  regions   %s" % _regions_label(chip, image.segments),
-                 "  erase     %s" % ("%d sector(s) first" % len(sectors)
-                                     if args.erase == "sectors" else "none"),
-                 "  WARNING   flash is erased and rewritten; this cannot be undone"]
-        if any(chip.region_of(seg.addr) == "ucb" for seg in image.segments):
-            lines.append("  WARNING   UCB write: applies at the next reset; check `tcprog ucb` first")
-        sys.stderr.write("\n".join(lines) + "\n")
-        try:
-            if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
-                return _error("aborted", EX_REFUSED)
-        except EOFError:
-            return _error("aborted (no tty for confirmation; pass --yes)", EX_REFUSED)
-
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
+    plan = None if auto else _write_plan(chip, image, args)
+    dap = _open_dap(args)
     with dap:
-        halt = chip.family == "tc3xx" and any(_is_pflash(seg.addr) for seg in image.segments)
+        if auto:
+            chip = _detect_chip(dap, args)
+            plan = _write_plan(chip, image, args)
+        halt = (driven_layout(chip.family).halt_for_pflash
+                and any(_is_pflash(seg.addr) for seg in image.segments))
+        _unlock_if_locked(dap, args, chip, halt=halt, confirm=True,
+                          spans=[(segment.addr, segment.end) for segment in image.segments])
         try:
-            _unlock_if_locked(dap, args, chip, halt=halt)
-        except Fail as f:
-            return _error(f, f.code)
-        try:
-            fam = chip.family if chip.family == "tc4xx" else "tc3xx"
-            return _program(dap, image, args, family=fam)
+            return _program(dap, image, args, chip, plan)
         except DapError as error:
-            return _error("flash operation failed: %s" % error, os.EX_IOERR)
+            return _error("write failed: %s" % error, os.EX_IOERR)
         finally:
             _after(dap, args, halt)
 
 
+def _refuse_protected(chip, spans, flag):
+    """Raise Fail if any (lo, hi) span overlaps a range with `flag` set
+    (write_protected or erase_protected)."""
+    for lo, hi in spans:
+        region = chip.protected_at(lo, hi, flag)
+        if region is not None:
+            raise Fail("0x%08X..0x%08X overlaps the %s range %s (0x%08X..0x%08X)"
+                       % (lo, hi, flag.replace("_", "-"), region.name, region.base,
+                          region.end), EX_REFUSED)
+
+
+def _erase_plan(chip, args):
+    """The checks of an erase and its confirmation prompt.
+    -> [(first, count, sector size)], one run per range. Raises Fail."""
+    _check_supported(chip, "erase")
+    if args.region and (args.addr is not None or args.length is not None):
+        raise Fail("erase takes --region or --addr/--length, not both", os.EX_USAGE)
+    if args.region:
+        ranges = _region_ranges(chip, args.region)
+    elif args.addr is None or args.length is None:
+        raise Fail("erase needs --addr and --length, or --region", os.EX_USAGE)
+    else:
+        ranges = [(args.addr, args.length)]
+    layout = driven_layout(chip.family)
+    plan = []
+    for addr, length in ranges:
+        sector = _log_sector_size(addr, layout)
+        if sector is None or _log_sector_size(addr + length - 1, layout) != sector:
+            raise Fail("0x%08X..0x%08X is not PFLASH, DFLASH or a UCB; erase supports only "
+                       "those" % (addr, addr + length), os.EX_USAGE)
+        plan.append(_flash_sectors(addr, length, sector) + (sector,))
+    if args.region and not args.allow_erase_all:
+        raise Fail("erasing whole regions (%s) needs --allow-erase-all"
+                   % ",".join(args.region), EX_REFUSED)
+    spans = [(first, first + count * sector) for first, count, sector in plan]
+    # SAFETY GATE: as for a write, a UCB is erased only with --enable-ucb-write.
+    ucb = any(region.kind == "ucb" and region.base < hi and lo < region.end
+              for lo, hi in spans for region in chip.memory)
+    if ucb and not args.enable_ucb_write:
+        raise Fail("the erase covers a UCB and --enable-ucb-write is not set; an erased UCB "
+                   "can lock you out of the part or stop it booting",
+                   EX_REFUSED)
+    _refuse_protected(chip, spans, "write_protected")
+    _refuse_protected(chip, spans, "erase_protected")
+    if not args.yes:
+        lines = ["tcprog: erase on %s" % chip.name]
+        lines += ["  range     0x%08X..0x%08X  %d sector(s)"
+                  % (first, first + count * sector, count) for first, count, sector in plan]
+        if ucb:
+            lines.append("  WARNING   UCB erase: applies at the next reset; check "
+                         "`tcprog ucb` first")
+        lines.append("  WARNING   the contents are erased; this cannot be undone")
+        _confirm_or_abort(lines)
+    return plan
+
+
 def _cmd_erase(args):
-    if args.transport != "dap":
-        return _todo("erase over %s" % args.transport)
-    chip, error = _resolve_chip(args)
+    auto = (args.chip or "").lower() == "auto" and not args.device
+    chip, error = (None, None) if auto else _resolve_chip(args)
     if error:
         return _error(error, os.EX_USAGE)
-    if chip is None:
-        return _error("erase requires the target: pass -c/--chip or --device", os.EX_USAGE)
-    if chip.family == "tc2xx":
-        return _error("erase is not supported on TC2xx yet (FLASH0 status registers "
-                      "differ from the TC3xx/TC4xx DMU)", os.EX_UNAVAILABLE)
+    if chip is None and not auto:
+        return _error("erase needs the target; pass -c/--chip (or -c auto to detect it) "
+                      "or --device FILE", os.EX_USAGE)
 
-    addr, length, whole = args.addr, args.length, False
-    if args.region:
-        seg = chip.first(args.region)
-        if seg is None:
-            return _error("%s has no %s region" % (chip.name, args.region), os.EX_USAGE)
-        addr, length, whole = seg.base, seg.size, True
-    if addr is None or length is None:
-        return _error("erase needs --addr and --length, or --region", os.EX_USAGE)
-    fam = chip.family if chip.family == "tc4xx" else "tc3xx"
-    sector = _sector_size(addr, profile_for_family(fam))
-    if sector is None:
-        return _error("erase supports PFLASH and DFLASH only", os.EX_USAGE)
-    if whole and not args.allow_erase_all:
-        return _error("erasing the whole %s region needs --allow-erase-all" % args.region,
-                      EX_REFUSED)
-
-    first, count = _flash_sectors(addr, length, sector)
-    end = first + count * sector
-    if not args.yes:
-        sys.stderr.write("tcprog: erase on %s\n"
-                         "  range     0x%08X..0x%08X  %d sector(s)\n"
-                         "  WARNING   the contents are erased; this cannot be undone\n"
-                         % (chip.name, first, end, count))
-        try:
-            if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
-                return _error("aborted", EX_REFUSED)
-        except EOFError:
-            return _error("aborted (no tty for confirmation; pass --yes)", EX_REFUSED)
-
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
+    plan = None if auto else _erase_plan(chip, args)
+    dap = _open_dap(args)
     with dap:
-        halt = chip.family == "tc3xx" and _is_pflash(first)
+        if auto:
+            chip = _detect_chip(dap, args)
+            plan = _erase_plan(chip, args)
+        spans = [(first, first + count * sector) for first, count, sector in plan]
+        halt = (driven_layout(chip.family).halt_for_pflash
+                and any(_is_pflash(first) for first, _, _ in plan))
+        _unlock_if_locked(dap, args, chip, halt=halt, confirm=True, spans=spans)
         try:
-            _unlock_if_locked(dap, args, chip, halt=halt)
-        except Fail as f:
-            return _error(f, f.code)
-        try:
-            flash = Flash(dap, fam)
+            flash = Flash(dap, chip)
             flash.clear_status()
             flash.clear_errors()
-            log("tcprog: erasing %d sector(s) from 0x%08X..." % (count, first), verbose=True)
-            flash.erase_range(first, count, sector)
+            for first, count, sector in plan:
+                log("tcprog: erasing %d sector(s) from 0x%08X" % (count, first), verbose=True)
+                flash.erase_range(first, count, sector)
             flash.reset_to_read()
+            log("tcprog: erased %d sector(s) (%s)"
+                % (sum(count for _, count, _ in plan),
+                   ", ".join("0x%08X..0x%08X" % span for span in spans)), verbose=True)
         except DapError as error:
             return _error("erase failed: %s" % error, os.EX_IOERR)
         finally:
             _after(dap, args, halt)
-    if not args.quiet:
-        log("tcprog: erased %d sector(s) (0x%08X..0x%08X)" % (count, first, end))
     return os.EX_OK
-
-
-def _cmd_blankcheck(args):
-    if args.transport != "dap":
-        return _todo("blankcheck over %s" % args.transport)
-    chip, error = _resolve_chip(args)
-    if error:
-        return _error(error, os.EX_USAGE)
-    if chip is None:
-        return _error("blankcheck requires the target: pass -c/--chip or --device",
-                      os.EX_USAGE)
-    # Covered: TC3xx (2G DMU HF_*) and TC4 (TC4Dx HCI_*). TC2xx has a different
-    # FLASH0 FSR layout and is not handled, so refuse rather than drive its flash.
-    if chip.family not in ("tc3xx", "tc4xx"):
-        return _error("blankcheck covers TC3xx and TC4 (the verify-error decode and "
-                      "FSI register map are DMU-specific; %s is %s)"
-                      % (chip.name, chip.family), os.EX_UNAVAILABLE)
-
-    addr, length = args.addr, args.length
-    if args.region:
-        seg = chip.first(args.region)
-        if seg is None:
-            return _error("%s has no %s region" % (chip.name, args.region), os.EX_USAGE)
-        addr = seg.base if addr is None else addr
-        length = seg.size if length is None else length
-    if addr is None or length is None:
-        return _error("blankcheck needs --addr and --length, or --region pflash", os.EX_USAGE)
-    if not _is_pflash(addr):
-        return _error("blankcheck supports PFLASH only", os.EX_USAGE)
-
-    try:
-        dap = _open_dap(args)
-    except Fail as f:
-        return _error(f, f.code)
-    with dap:
-        try:
-            id_addr, chipid = _unlock_if_locked(dap, args, chip)
-        except Fail as f:
-            return _error(f, f.code)
-        # Cross-check the silicon before driving its flash: the FSI sequence must
-        # never land on a part that only matched because -c said so. The detected
-        # family also picks the register profile, so it must agree with -c.
-        detected = by_chipid(chipid, id_addr)
-        if detected is not None and detected.family not in ("tc3xx", "tc4xx"):
-            return _error("refusing to blank-check: connected target is %s (%s), not a "
-                          "TC3xx/TC4 part" % (detected.name, detected.family), EX_REFUSED)
-        if detected is not None and detected.family != chip.family:
-            return _error("refusing to blank-check: connected target is %s (%s) but -c "
-                          "says %s (%s); the FSI register map differs per family"
-                          % (detected.name, detected.family, chip.name, chip.family),
-                          EX_REFUSED)
-        if detected is None:
-            return _error("refusing to blank-check: cannot confirm the connected part "
-                          "(chipid 0x%08X unrecognised)" % (chipid or 0), EX_REFUSED)
-
-        checking = Progress("blank-check", _pflash_sectors(addr, length)[1], " sectors",
-                            not args.quiet and not args.no_progress)
-
-        def progress(done, total, sa, blank):
-            checking.update(done)
-
-        try:
-            sectors = blank_map(dap, addr, length, on_progress=progress,
-                                family=chip.family)
-        except DapError as error:
-            checking.finish()
-            return _error("blankcheck failed: %s" % error, os.EX_IOERR)
-        checking.finish()
-
-    # merge contiguous programmed sectors into ranges
-    prog = [sa for sa, blank in sectors if not blank]
-    ranges, step = [], PFLASH_LOG_SECTOR
-    for sa in prog:
-        if ranges and ranges[-1][1] == sa:
-            ranges[-1][1] = sa + step
-        else:
-            ranges.append([sa, sa + step])
-    prog_bytes = len(prog) * step
-
-    if args.json:
-        print(json.dumps({"chip": chip.name, "addr": "0x%08X" % addr, "length": length,
-                          "sector": step, "sectors": len(sectors),
-                          "programmed_sectors": len(prog),
-                          "programmed": [{"addr": "0x%08X" % a, "end": "0x%08X" % b}
-                                         for a, b in ranges]}))
-    else:
-        for a, b in ranges:
-            print("  programmed  0x%08X .. 0x%08X  (%d KiB)" % (a, b, (b - a) // 1024))
-        if not ranges:
-            print("  (all %d sectors blank)" % len(sectors))
-        if not args.quiet:
-            sys.stderr.write("tcprog: %d/%d sectors programmed (%d KiB) in [0x%08X,0x%08X)\n"
-                             % (len(prog), len(sectors), prog_bytes // 1024,
-                                addr, addr + length))
-    return os.EX_OK
-
-
-# Names of the UCBs most often written, by UCB index (TC3xx: 512 B UCBs from
-# 0xAF400000; TC4xx UCB0/UCB1: 2 KiB UCBs from 0xAE400000 / 0xAEC00000).
-_UCB_NAMES_TC3 = {0: "BMHD0_ORIG", 1: "BMHD1_ORIG", 2: "BMHD2_ORIG", 3: "BMHD3_ORIG",
-                  8: "BMHD0_COPY", 9: "BMHD1_COPY", 10: "BMHD2_COPY", 11: "BMHD3_COPY",
-                  16: "PFLASH_ORIG", 17: "DFLASH_ORIG", 18: "DBG_ORIG",
-                  24: "PFLASH_COPY", 25: "DFLASH_COPY", 26: "DBG_COPY"}
-_UCB_NAMES_TC4 = {(0, 9): "RTC_BMHD0", (0, 10): "RTC_BMHD1", (0, 11): "RTC_BMHD2",
-                  (0, 12): "RTC_BMHD3", (0, 21): "RTC_FLASH_ORIG", (0, 22): "RTC_FLASH_COPY",
-                  (1, 1): "DBGCS_ORIG", (1, 2): "DBGCS_COPY"}
-
-
-def _ucb_name(chip, addr):
-    if chip.family == "tc4xx":
-        block = 0 if addr < 0xAEC00000 else 1
-        index = (addr - (0xAE400000, 0xAEC00000)[block]) // 0x800
-        return "UCB_" + _UCB_NAMES_TC4.get((block, index), "UCB%d_%02d" % (block, index))
-    index = (addr - 0xAF400000) // 0x200
-    return "UCB_" + _UCB_NAMES_TC3.get(index, "%d" % index)
 
 
 def _regions_label(chip, segments):
     """Comma list of the regions the segments touch, naming UCBs individually."""
     names = []
     for seg in segments:
-        region = chip.region_of(seg.addr)
-        name = _ucb_name(chip, seg.addr) if region == "ucb" else region
+        region = chip.kind_at(seg.addr)
+        name = ucb_name(chip, seg.addr) if region == "ucb" else region
         if name not in names:
             names.append(name)
     return ", ".join(names)
 
 
 def _dry_run_plan(image, args, chip):
-    region = chip.region_of
+    region = chip.kind_at
     touches_ucb = any(region(seg.addr) == "ucb" for seg in image.segments)
     in_gap = [seg for seg in image.segments if region(seg.addr) == "?"]
-    if args.json:
-        print(json.dumps({
-            "dry_run": True, "image": os.path.basename(args.firmware),
-            "loader": image.loader, "start": image.start, "total_bytes": image.total_bytes,
-            "segments": [{"addr": seg.addr, "len": len(seg.data), "region": region(seg.addr)}
-                         for seg in image.segments],
-            "transport": args.transport, "erase": args.erase,
-            "verify": not args.no_verify, "touches_ucb": touches_ucb,
-            "in_gap": bool(in_gap)}))
-        return os.EX_OK
     print("tcprog: dry-run (nothing will be written)")
     print("  image     %s  (%s via %s)" % (os.path.basename(args.firmware),
                                            args.format or "auto", image.loader))
@@ -1130,8 +1304,7 @@ def _dry_run_plan(image, args, chip):
     low, high = image.span
     print("  total     %d B in %d segment(s), span 0x%08X..0x%08X"
           % (image.total_bytes, len(image.segments), low, high))
-    print("  transport %s   erase %s   verify %s"
-          % (args.transport, args.erase, "no" if args.no_verify else "yes"))
+    print("  erase %s   verify %s" % (args.erase, "no" if args.no_verify else "yes"))
     if touches_ucb:
         print("  WARNING   image covers a UCB region; a real write is REFUSED "
               "without --enable-ucb-write (bricking risk).")
@@ -1149,4 +1322,8 @@ def main(argv=None):
         parser.print_help()
         return os.EX_OK
     set_verbose(getattr(args, "verbose", 0))
-    return args.func(args)
+    log(BANNER, verbose=True)
+    try:
+        return args.func(args)
+    except Fail as f:
+        return _error(f, f.code)

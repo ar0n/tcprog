@@ -1,0 +1,14 @@
+# Register map assumed equal to TC23x, unverified on silicon. The UCB block is not
+# listed.
+name = "tc21x"
+base = "tc2xx"
+aliases = ["tc212", "tc213", "tc214"]
+id_value = 0x1040
+
+[memory]
+pflash0 = { size = 0x80000 }
+dflash0 = { size = 0x10000 }
+ucb0    = false
+dflash1 = false
+pspr0   = { size = 0x2000 }
+dspr0   = { size = 0xC000 }

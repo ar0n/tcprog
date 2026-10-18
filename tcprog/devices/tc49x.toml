@@ -1,0 +1,11 @@
+# TC497 and TC499 share this memory map (20 MB PFLASH, 1 MB DFLASH0). UCB1 is not
+# listed, so write and erase refuse this entry. No public identity value: selected
+# with -c only.
+name = "tc49x"
+base = "tc4xx"
+aliases = ["tc497", "tc499"]
+asclin_flags = 0xF02C012C
+asclin_flagsclear = 0xF02C0134
+
+[memory]
+ucb1 = false

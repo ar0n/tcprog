@@ -1,0 +1,17 @@
+name = "tc36x"
+base = "tc3xx"
+aliases = ["tc364", "tc365", "tc366", "tc367"]
+id_value = 0x6080
+
+# Reduced PFLASH, by SCU_CHIPID.FSIZE: 3 MB (-48F) parts, PF0 2 MB and PF1 1 MB.
+[pflash_variants]
+"6" = [[0xA0000000, 0x200000], [0xA0300000, 0x100000]]
+
+[memory]
+# PFLASH is two 2 MB banks in 3 MB slots, with a reserved gap at 0xA0200000 (not
+# confirmed on silicon).
+pflash0 = { size = 0x200000 }
+pflash1 = { kind = "pflash", base = 0xA0300000, size = 0x200000 }
+dflash0 = { size = 0x20000 }
+pspr0   = { size = 0x8000 }
+dspr0   = { size = 0x30000 }

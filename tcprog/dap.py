@@ -3,6 +3,8 @@
 """DAP transport (FTDI-MPSSE). ftdi1 (libftdi1) is imported lazily so
 list/chips/dry-run need no USB.
 """
+import time
+
 DEFAULT_VID, DEFAULT_PID = 0x058B, 0x0043
 _CMD_W, _CMD_R, _CMD_FLUSH = 0x19, 0x28, 0x87
 _ADBUS_VAL, _ADBUS_DIR, _ACBUS_DIR = 0x80, 0xDB, 0xF7
@@ -11,7 +13,6 @@ _ACBUS_IDLE, _ACBUS_IDLE_RESET, _ACBUS_TX, _ACBUS_RX = 0x57, 0x55, 0x67, 0x57
 CMD_WRITEREG, CMD_WRITEMEM, CMD_READMEM, CMD_DAPISC, CMD_READREG, CMD_SET_IO_CLIENT = 8, 9, 10, 17, 26, 28
 REG_READ32 = 0x5
 SCU_CHIPID = 0xF0036140          # target identity register (TC2xx/TC3xx)
-CBS_JTAGID_TC4 = 0xFA180080      # TC4xx has no SCU_CHIPID; identity is the JTAG ID
 # Block read: the READMEM low byte is (size & 0x3FC) | 1, so a 1024-byte read is
 # 0x400 & 0x3FC = 0 | 1 = 1 (the "IOADDR" selector); its reply is 1228 bytes.
 _REG_BLOCK, _RESP_BLOCK = 0x1, 1228
@@ -91,21 +92,20 @@ def _read_rwdata(reply, count):
     return bytes(out)
 
 
-_CONNECT = (
-    (_telegram(CMD_SET_IO_CLIENT, 1, 3), 3),
-    (_telegram(CMD_WRITEREG, 0xC10, 16), 7),
-    (_readmem(0xF0036140, REG_READ32), 16),
-    (_telegram(CMD_SET_IO_CLIENT, 1, 3), 3),
-    (_telegram(CMD_WRITEREG, 0xC10, 16), 7),
+_DAPISC16 = _telegram(CMD_DAPISC, 0x0F00, 16)
+_DAPISC48 = _telegram(CMD_DAPISC, 0x4ABBAF530400, 48)
+_SET_IO_CLIENT = _telegram(CMD_SET_IO_CLIENT, 1, 3)
+_SEL_CONF = _telegram(CMD_WRITEREG, 0xC10, 16)
+_READ_IOINFO = _telegram(CMD_READREG, 0x4B, 7)   # IOINFO
+_IO_SELECT = ((_SET_IO_CLIENT, 3), (_SEL_CONF, 7))
+_CONNECT = _IO_SELECT + (
+    (_readmem(SCU_CHIPID, REG_READ32), 16),
+) + _IO_SELECT + (
     (_readmem(0xAF400A00, 0x0D) + bytes(23), 26),
-    (_telegram(CMD_DAPISC, 0xF00, 16), 5),
-    (_telegram(CMD_DAPISC, 0x4ABBAF530400, 48), 5),
-    (_telegram(CMD_SET_IO_CLIENT, 1, 3), 3),
-    (_telegram(CMD_READREG, 0x4B, 7), 9),
-)
-_IO_SELECT = (
-    (_telegram(CMD_SET_IO_CLIENT, 1, 3), 3),
-    (_telegram(CMD_WRITEREG, 0xC10, 16), 7),
+    (_DAPISC16, 5),
+    (_DAPISC48, 5),
+    (_SET_IO_CLIENT, 3),
+    (_READ_IOINFO, 9),
 )
 
 
@@ -118,12 +118,8 @@ _IO_SELECT = (
 CMD_KEY_EXCHANGE = 0x76D6E24A
 REG_COMDATA = 0x4
 IOINFO_DIALOGUE = 0x00380080          # startup software listening for the key
-_DAPISC16 = _telegram(CMD_DAPISC, 0x0F00, 16)
-_DAPISC48 = _telegram(CMD_DAPISC, 0x4ABBAF530400, 48)
 _OJCONF_503 = _telegram(CMD_WRITEREG, 0x503E, 20)
 _OJCONF_HARR = _telegram(CMD_WRITEREG, 0x1303E, 20)   # halt-after-reset request
-_SEL = _telegram(CMD_SET_IO_CLIENT, 1, 3)
-_POLL = _telegram(CMD_READREG, 0x4B, 7)   # IOINFO
 
 
 def _comdata_write(value):
@@ -143,12 +139,13 @@ def parse_password(text):
 def _unlock_failed_msg(dap, tries):
     """A diagnostic (no `tcprog:` prefix) that separates a bad password from a
     bad boot mode / timing."""
-    reached = getattr(dap, "reached_count", 0)
+    reached = dap.reached_count
     if reached:
-        return ("unlock failed after %d attempts - reached the SSW dialogue %d time(s) "
-                "but the password was refused; check the password." % (tries, reached))
-    return ("unlock failed after %d attempts - never reached the SSW dialogue; the part "
-            "is likely strapped to BSL (DAP unlock needs flash boot)." % tries)
+        return ("debug unlock failed after %d attempts; the startup dialogue was reached "
+                "%d time(s) but the password was refused" % (tries, reached))
+    return ("debug unlock failed after %d attempts; the startup dialogue was never "
+            "reached, so the part is likely strapped to BSL (DAP unlock needs flash boot)"
+            % tries)
 
 
 def parse_probe(text):
@@ -171,6 +168,7 @@ class Dap:
         holds nSRST while the link is set up; the first transfer releases it."""
         import ftdi1 as ftdi
         self._ftdi = ftdi
+        self.reached_dialogue, self.reached_count = False, 0
         self.ctx = ftdi.new()
         if self.ctx is None:
             raise DapError("ftdi_new failed")
@@ -191,7 +189,6 @@ class Dap:
                 + bytes((0x80, _ADBUS_VAL, _ADBUS_DIR))
                 + bytes((0x82, _ACBUS_IDLE_RESET if reset_on_open else _ACBUS_IDLE,
                          _ACBUS_DIR)))
-        self.hz = 60e6 / (2 * (div + 1))
 
     def _flush(self):
         ftdi = self._ftdi
@@ -202,7 +199,6 @@ class Dap:
             raise DapError("short write")
 
     def _r(self, n, timeout=2.0):
-        import time
         out, deadline = bytearray(), time.time() + timeout
         while len(out) < n:
             rc, buf = self._ftdi.read_data(self.ctx, n - len(out))
@@ -271,7 +267,6 @@ class Dap:
         releases. The dialogue has to be entered within a couple of ms of the
         release, so the caller batches the key exchange right after this.
         """
-        import time
         self._w(bytes((0x82, _ACBUS_RX & ~0x02, _ACBUS_DIR)))
         time.sleep(hold)
         self._w(bytes((0x82, _ACBUS_RX, _ACBUS_DIR)))
@@ -296,7 +291,7 @@ class Dap:
             off += n
         return out
 
-    def _unlock_attempt(self, words, hold=0.010, settle=0.0):
+    def _unlock_attempt(self, words):
         """One unlock attempt. -> (unlocked, chipid). Sets self.reached_dialogue.
 
         The SSW's COMDATA dialogue has to be entered within a couple of ms of
@@ -304,10 +299,10 @@ class Dap:
         exchange rides in one USB transfer (no round trip between the OJCONF
         write and the key word).
         """
-        self.pulse_reset(hold, settle)
-        steps = [(_DAPISC16, 5), (_DAPISC48, 5), (_SEL, 3), (_POLL, 9),
+        self.pulse_reset(0.010, 0.0)
+        steps = [(_DAPISC16, 5), (_DAPISC48, 5), (_SET_IO_CLIENT, 3), (_READ_IOINFO, 9),
                  (_OJCONF_503, 7), (_comdata_write(CMD_KEY_EXCHANGE), 7)]
-        steps += [(_POLL, 9)] * 10
+        steps += [(_READ_IOINFO, 9)] * 10
         out = self._batched(steps)
 
         def io(reply):
@@ -318,23 +313,22 @@ class Dap:
         if not self.reached_dialogue:
             return False, None                      # never reached the window
         for w in words:
-            self._batched([(_POLL, 9), (_comdata_write(w), 7)])
-        self._batched([(_SEL, 3), (_POLL, 9)])
-        chipid = self.try_read_word(0xF0036140)
-        return (chipid not in (None, 0, 0xFFFFFFFF)), chipid
+            self._batched([(_READ_IOINFO, 9), (_comdata_write(w), 7)])
+        self._batched([(_SET_IO_CLIENT, 3), (_READ_IOINFO, 9)])
+        chipid = self.try_read_word(SCU_CHIPID)
+        return not _locked(chipid), chipid
 
-    CPU0_PC = 0xF881FE08                    # TC3xx/TC4xx CPU0 core register PC
+    CPU0_PC = 0xF881FE08                    # TC3xx CPU0 core register PC
 
     def halt_after_reset(self, tries=3):
         """Reset with a Halt-After-Reset request, so the startup software stops
         CPU0 at the first user-code instruction before the application runs.
         -> the halted PC, or None if CPU0 did not stay halted. Needs an open debug
         interface after the reset."""
-        import time
         for _ in range(tries):
             self.pulse_reset(0.010, 0.0)
-            self._batched([(_DAPISC16, 5), (_DAPISC48, 5), (_SEL, 3), (_POLL, 9),
-                           (_OJCONF_HARR, 7), (_POLL, 9)])
+            self._batched([(_DAPISC16, 5), (_DAPISC48, 5), (_SET_IO_CLIENT, 3), (_READ_IOINFO, 9),
+                           (_OJCONF_HARR, 7), (_READ_IOINFO, 9)])
             time.sleep(0.2)
             self.connect()
             first = self.read_word_retry(self.CPU0_PC)
@@ -342,7 +336,7 @@ class Dap:
                 return first
         return None
 
-    def unlock(self, words, tries=3, settle=0.0, on_attempt=None):
+    def unlock(self, words, tries=3, on_attempt=None):
         """Retry the key exchange until it unlocks. -> (unlocked, chipid, tries).
 
         A correct password usually unlocks on the first attempt; an occasional
@@ -352,12 +346,12 @@ class Dap:
         self.reached_count = 0
         for k in range(1, tries + 1):
             try:
-                ok, chipid = self._unlock_attempt(words, settle=settle)
+                ok, chipid = self._unlock_attempt(words)
             except DapError as error:
                 if on_attempt:
                     on_attempt(k, False, str(error))
                 continue
-            reached = getattr(self, "reached_dialogue", False)
+            reached = self.reached_dialogue
             if reached:
                 self.reached_count += 1
             if on_attempt:
@@ -367,6 +361,7 @@ class Dap:
         return False, None, tries
 
     BLOCK = 1024
+    GROUP = 16                              # blocks per USB transfer
 
     def read_block(self, addr):
         """1024 bytes from a 1 KiB-aligned address."""

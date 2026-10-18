@@ -6,11 +6,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tcprog"
 version = "0.1.0"
-description = "AURIX TC2xx/TC3xx/TC4xx flash programmer over an FTDI-MPSSE DAP or ASC BSL"
+description = "AURIX TC2xx/TC3xx/TC4xx flash programmer for DAP probes based on FTDI chips (e.g. miniWiggler)"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Aron Szabo", email = "aron@aron.ws"}]
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -32,4 +32,4 @@ tcprog = "tcprog.cli:main"
 include = ["tcprog*"]
 
 [tool.setuptools.package-data]
-tcprog = ["devices/*.json"]
+tcprog = ["devices/*.toml", "devices/family/*.toml"]

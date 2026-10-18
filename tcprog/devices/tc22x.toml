@@ -1,0 +1,12 @@
+# Register map assumed equal to TC23x, unverified on silicon.
+name = "tc22x"
+base = "tc2xx"
+aliases = ["tc222", "tc223", "tc224"]
+id_value = 0x2040
+
+[memory]
+pflash0 = { size = 0x100000 }
+dflash0 = { size = 0x18000 }
+dflash1 = false
+pspr0   = { size = 0x2000 }
+dspr0   = { size = 0x16000 }

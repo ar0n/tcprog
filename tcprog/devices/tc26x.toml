@@ -1,0 +1,12 @@
+# No DFLASH1 (no HSM).
+name = "tc26x"
+base = "tc2xx"
+aliases = ["tc264", "tc264da", "tc265", "tc267", "tc26b"]
+id_value = 0x6040
+
+[memory]
+pflash0 = { size = 0x280000 }
+dflash0 = { size = 0x18000 }
+dflash1 = false
+pspr0   = { size = 0x4000 }
+dspr0   = { size = 0x12000 }

@@ -1,0 +1,13 @@
+name = "tc38x"
+base = "tc3xx"
+aliases = ["tc387", "tc389"]
+id_value = 0x8080
+
+# Reduced PFLASH, by SCU_CHIPID.FSIZE: 8 MB (-128F) parts come as 3+1+3+1 MB or as
+# 3+3+2 MB with the same CHIPID; these are the ranges present in both.
+[pflash_variants]
+"B" = [[0xA0000000, 0x400000], [0xA0600000, 0x200000]]
+
+[memory]
+pflash0 = { size = 0xA00000 }
+dflash0 = { size = 0x80000 }

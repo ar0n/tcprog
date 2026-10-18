@@ -1,0 +1,16 @@
+# TC33x and TC33xEXT share this flash map and CHID.
+name = "tc33x"
+base = "tc3xx"
+aliases = ["tc332", "tc333", "tc334", "tc336", "tc337", "tc33xext", "tc336da", "tc337da",
+           "tc337dz"]
+id_value = 0x3080
+
+# Reduced PFLASH, by SCU_CHIPID.FSIZE: 1 MB (TC33xEXT -16F) parts.
+[pflash_variants]
+"2" = [[0xA0000000, 0x100000]]
+
+[memory]
+pflash0 = { size = 0x200000 }
+dflash0 = { size = 0x20000 }
+pspr0   = { size = 0x2000 }
+dspr0   = { size = 0x30000 }

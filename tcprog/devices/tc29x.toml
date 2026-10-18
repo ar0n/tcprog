@@ -1,0 +1,10 @@
+name = "tc29x"
+base = "tc2xx"
+aliases = ["tc297", "tc298", "tc299", "tc29b"]
+id_value = 0x9040
+
+[memory]
+pflash0 = { size = 0x800000 }
+dflash0 = { size = 0xC0000 }
+pspr0   = { size = 0x8000 }
+dspr0   = { size = 0x1E000 }

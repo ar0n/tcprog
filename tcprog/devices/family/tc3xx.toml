@@ -1,0 +1,35 @@
+# AURIX TC3xx (2G). DF1 (used by the HSM) is 128 KiB in single-ended mode (64 KiB in
+# complement sensing).
+# Family defaults: a chip file names this file with base = "tc3xx" and may override any
+# key. [memory] is the base map: a chip inherits its ranges, replaces one by giving a
+# range of the same name, and removes one with `name = false`.
+
+# A part's id_value is matched under id_mask: SCU_CHIPID CHID[15:12] and CHTEC, so
+# any variant, step or microcode version of the series is recognised.
+family = "tc3xx"
+id_addr = 0xF0036140
+id_mask = 0x0000F0C0
+bsl_load = 0xC0000000
+asclin_flags = 0xF0000634
+asclin_flagsclear = 0xF000063C
+asclin_txdata = 0xF0000644
+asclin_rxdata = 0xF0000648
+wdt_cpu0con0 = 0xF003624C
+wdt_safcon0 = 0xF00362A8
+proconpf = 0xF8040080
+procondf = 0xF8040088
+procondbg = 0xF8040090
+hf_protect = 0xF804001C
+
+[memory]
+pflash0 = { kind = "pflash", base = 0xA0000000, size = 0x600000 }
+dflash0 = { kind = "dflash", base = 0xAF000000, size = 0x40000 }
+# UCB block, 48 x 512 B.
+ucb0    = { kind = "ucb",    base = 0xAF400000, size = 0x6000, erase_protected = true }
+cfs     = { kind = "cfs",    base = 0xAF800000, size = 0x10000 }
+# DF1 EEPROM, used by the HSM
+dflash1 = { kind = "dflash", base = 0xAFC00000, size = 0x20000 }
+# CPU0 PSPR at its local address (as CPU0 sees it); BSL loads stage 1 here
+pspr0   = { kind = "pspr",   base = 0xC0000000, size = 0x10000 }
+# CPU0 DSPR at its local address (as CPU0 sees it); payload stack and CSA
+dspr0   = { kind = "dspr",   base = 0xD0000000, size = 0x3C000 }

@@ -1,0 +1,22 @@
+# AURIX TC4xx (3G). There is no SCU_CHIPID; the identity register is CBS_JTAGID at
+# 0xFA180080, and the mask drops its version nibble.
+# Family defaults: a chip file names this file with base = "tc4xx" and may override any
+# key. [memory] is the base map: a chip inherits its ranges, replaces one by giving a
+# range of the same name, and removes one with `name = false`.
+
+family = "tc4xx"
+id_addr = 0xFA180080
+id_mask = 0x0FFFFFFF
+bsl_load = 0xC0000000
+asclin_flags = 0xF46C012C
+asclin_flagsclear = 0xF46C0134
+# GP_HOST_PROTECT: PRODISFL (bit 13) shows Disable Protection in effect.
+hf_protect = 0xF804052C
+
+[memory]
+pflash0 = { kind = "pflash", base = 0xA0000000, size = 0x1400000 }
+dflash0 = { kind = "dflash", base = 0xAE000000, size = 0x100000 }
+# UCB0, 2 KiB UCBs (UCB_RTC_BMHD0..3, UCB_RTC_FLASH, ...).
+ucb0    = { kind = "ucb",    base = 0xAE400000, size = 0x14000, erase_protected = true }
+# UCB1, 2 KiB UCBs (UCB_DBGCS, ...).
+ucb1    = { kind = "ucb",    base = 0xAEC00000, size = 0xD000, erase_protected = true }

@@ -13,7 +13,7 @@ EX_CHECK = 80    # ident --check: detected part != expected
 EX_VERIFY = 81   # read-back verification mismatch
 EX_REFUSED = 82  # a destructive op refused for safety (e.g. UCB write w/o flag)
 
-# --- verbose logging (set once from -v/--verbose in main; higher = more detail) ---
+# --- verbose logging (set once from -v/--verbose in main; on or off) ---
 _VERBOSE_MODE = 0
 
 
@@ -31,9 +31,17 @@ def log(msg, verbose=False):
 
 
 def _error(msg, code):
-    """Print `tcprog: <msg>` to stderr and return the exit code (for `return _error(...)`)."""
-    sys.stderr.write("tcprog: %s\n" % msg)
+    """Print `tcprog: error: <msg>` to stderr, or `tcprog: refused: <msg>` for a
+    safety refusal (EX_REFUSED), and return the exit code (for `return
+    _error(...)`). Messages start lowercase, have no trailing period, and put a
+    reason or hint after "; "."""
+    sys.stderr.write("tcprog: %s: %s\n" % ("refused" if code == EX_REFUSED else "error", msg))
     return code
+
+
+def warn(msg):
+    """Print `tcprog: warning: <msg>` to stderr: the operation goes on."""
+    sys.stderr.write("tcprog: warning: %s\n" % msg)
 
 
 class Fail(Exception):
@@ -50,7 +58,8 @@ class Progress:
     updated in place; otherwise (CI logs, pipes, files) it prints a plain line at
     most every 10 % (plus a heartbeat every `interval` seconds on slow steps), so
     logs stay short and readable.
-    Disabled entirely with enabled=False (--no-progress / --quiet)."""
+    Shown with --progress; disabled entirely with enabled=False. Use it as a
+    context manager so the line is finished on every exit path."""
 
     def __init__(self, label, total, unit="", enabled=True, interval=30.0):
         self.label, self.total, self.unit = label, max(total, 1), unit
@@ -65,7 +74,7 @@ class Progress:
         if not self.enabled:
             return
         pct = min(100, int(done * 100 / self.total))
-        text = "  %s %d/%d%s (%d%%)%s" % (self.label, done, self.total, self.unit, pct, extra)
+        text = "tcprog: %s %d/%d%s (%d%%)%s" % (self.label, done, self.total, self.unit, pct, extra)
         if self.tty:
             sys.stderr.write("\r" + text)
             sys.stderr.flush()
@@ -76,6 +85,12 @@ class Progress:
             sys.stderr.write(text + "\n")
             sys.stderr.flush()
             self._last_step, self._last_time = pct // 10, now
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.finish()
 
     def finish(self):
         """End the in-place line on a terminal (plain lines need nothing)."""

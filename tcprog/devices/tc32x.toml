@@ -1,0 +1,16 @@
+# Same silicon as TC33x with a smaller memory map.
+name = "tc32x"
+base = "tc3xx"
+aliases = ["tc322", "tc323", "tc324", "tc327"]
+id_value = 0x2080
+
+# Reduced PFLASH, by SCU_CHIPID.FSIZE: 1 MB (-16F) parts.
+[pflash_variants]
+"2" = [[0xA0000000, 0x100000]]
+
+[memory]
+pflash0 = { size = 0x180000 }
+dflash0 = { size = 0x18000 }
+pspr0   = { size = 0x2000 }
+# 96 KB (144 KB on some parts)
+dspr0   = { size = 0x18000 }

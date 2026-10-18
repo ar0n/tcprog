@@ -1,0 +1,9 @@
+# TC37x and TC37xEXT share this memory map and CHID.
+name = "tc37x"
+base = "tc3xx"
+aliases = ["tc374", "tc375", "tc377", "sak-tc375tp", "tc37xext", "tc377tx"]
+id_value = 0x7080
+
+# Reduced PFLASH, by SCU_CHIPID.FSIZE: 4 MB (-64F, TC377TX), 2 MB in each bank slot.
+[pflash_variants]
+"7" = [[0xA0000000, 0x200000], [0xA0300000, 0x200000]]

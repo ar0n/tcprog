@@ -26,7 +26,7 @@ class FirmwareSegment:
         return "FirmwareSegment(0x%08X, %d bytes)" % (self.addr, len(self.data))
 
 
-class ImageSegment:
+class FirmwareImage:
     __slots__ = ("segments", "start", "loader")
 
     def __init__(self, segments, start=None, loader=""):
@@ -46,7 +46,7 @@ class ImageSegment:
 
 
 def load_image(path, fmt=None, address=None):
-    """Load a firmware image -> ImageSegment. bincopy decodes the text formats (SREC /
+    """Load a firmware image -> FirmwareImage. bincopy decodes the text formats (SREC /
     Intel HEX / TI-TXT) by content; only the two it cannot - raw .bin (which
     needs an address) and ELF (binary) - are dispatched by the --format override
     or the extension. An extensionless ELF needs an explicit --format elf."""
@@ -69,17 +69,7 @@ def load_image(path, fmt=None, address=None):
     except bincopy.Error as error:
         raise ValueError("bad image %s: %s" % (path, error))
     segments = [FirmwareSegment(segment.address, segment.data) for segment in binfile.segments]
-    return ImageSegment(segments, binfile.execution_start_address, loader="bincopy")
-
-
-def emit_srec(image, execution_start_address=None):
-    binfile = bincopy.BinFile()
-    for segment in image.segments:
-        binfile.add_binary(bytes(segment.data), address=segment.addr)
-    start = execution_start_address if execution_start_address is not None else image.start
-    if start is not None:
-        binfile.execution_start_address = start
-    return binfile.as_srec()
+    return FirmwareImage(segments, binfile.execution_start_address, loader="bincopy")
 
 
 def _out_format(path):
@@ -95,17 +85,19 @@ def _out_format(path):
     return "bin"
 
 
-def _emit(data, addr, fmt):
-    """Serialise a read-back region to the chosen container. -> bytes."""
-    if fmt == "bin":
-        return bytes(data)
-    binfile = bincopy.BinFile()
-    binfile.add_binary(bytes(data), address=addr)
-    if fmt == "srec":
-        return binfile.as_srec().encode()
-    if fmt == "hex":
-        return binfile.as_ihex().encode()
-    raise ValueError("bad output format %r" % fmt)
+def flat_binary(segments, start, end, fill=0):
+    """[(addr, bytes)] as one flat image of [start, end), the bytes no segment
+    covers set to `fill`. -> (bytes, [(lo, hi)] filled spans)"""
+    out = bytearray([fill]) * (end - start)
+    gaps, pos = [], start
+    for addr, data in sorted(segments):
+        out[addr - start:addr - start + len(data)] = data
+        if addr > pos:
+            gaps.append((pos, addr))
+        pos = max(pos, addr + len(data))
+    if pos < end:
+        gaps.append((pos, end))
+    return bytes(out), gaps
 
 
 def _hexdump(data, base, out=sys.stdout):
@@ -135,6 +127,38 @@ def crc32_bmhd(header):
     return zlib.crc32(swapped) & 0xFFFFFFFF
 
 
+def _check_bmhdid(header, problems):
+    if header["bmhdid"] != BMHDID:
+        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
+
+
+def _check_stad(stad, label, chip, problems, unknown_chip_pflash=True):
+    """STAD word-aligned and in the chip's PFLASH. Without a chip, any address
+    in the 0x80000000/0xA0000000 PFLASH segments counts, or (with
+    unknown_chip_pflash False) the PFLASH check is skipped."""
+    if stad & 0x3:
+        problems.append("%s 0x%08X not word-aligned" % (label, stad))
+    if chip is not None:
+        in_pflash = any(rng.contains(stad) for rng in chip.ranges("pflash"))
+    elif unknown_chip_pflash:
+        in_pflash = (stad & 0xDF000000) == 0x80000000
+    else:
+        in_pflash = True
+    if not in_pflash:
+        problems.append("%s 0x%08X not in program flash" % (label, stad))
+
+
+def _check_crc(header, key, covered, problems):
+    """The CRC field `key` over the `covered` header bytes, and its inverted
+    copy `key`_n where the layout has one."""
+    expected = crc32_bmhd(covered)
+    if header[key] != expected:
+        problems.append("%s 0x%08X != 0x%08X" % (key.upper(), header[key], expected))
+    if key + "_n" in header and header[key + "_n"] != (~expected & 0xFFFFFFFF):
+        problems.append("%s_N invalid" % key.upper())
+
+
+# The three BMHD layouts differ; every parser reports the start address as "stad".
 def parse_bmhd_tc3(data):
     if len(data) < 16:
         raise ValueError("BMHD is 16 bytes")
@@ -151,27 +175,18 @@ def validate_bmhd_tc3(data, chip=None):
     if len(data) < 16:
         return False, ["shorter than 16 bytes"]
     header = parse_bmhd_tc3(data)
-    if header["bmhdid"] != BMHDID:
-        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
+    _check_bmhdid(header, problems)
     if header["hwcfg"] not in VALID_HWCFG:
         problems.append("HWCFG 0x%X not in {7,6,4,3}" % header["hwcfg"])
-    if header["stad"] & 0x3:
-        problems.append("STAD 0x%08X not word-aligned" % header["stad"])
-    in_pflash = ((header["stad"] & 0xDF000000) == 0x80000000)
-    if chip is not None:
-        in_pflash = any(sl.contains(header["stad"]) for sl in chip.slices("pflash"))
-    if not in_pflash:
-        problems.append("STAD 0x%08X not in program flash" % header["stad"])
-    expected = crc32_bmhd(data[0:8])
-    if header["crcbmhd"] != expected:
-        problems.append("CRCBMHD 0x%08X != 0x%08X" % (header["crcbmhd"], expected))
-    if header["crcbmhd_n"] != (~expected & 0xFFFFFFFF):
-        problems.append("CRCBMHD_N invalid")
+    if header["bmi"] & 0xF000:
+        problems.append("BMI reserved bits 15:12 not zero (0x%04X)" % header["bmi"])
+    _check_stad(header["stad"], "STAD", chip, problems)
+    _check_crc(header, "crcbmhd", data[0:8], problems)
     return (not problems), problems
 
 
 # TC2xx (AURIX 1G) Boot Mode Header, 32 bytes; the four BMHDs sit in PFLASH.
-# Layout differs from TC3xx: STADBM comes
+# Layout differs from TC3xx: STADABM comes
 # first, then BMI|BMHDID in word 1, a CRC-checked code range (ChkStart..ChkEnd +
 # CRCrange/!CRCrange), and finally CRChead/!CRChead over the first 24 bytes.
 # The TC2xx BMI layout (PINDIS bit 3, HWCFG 6:4) is not the TC3xx one, so BMI is reported raw.
@@ -179,7 +194,7 @@ def parse_bmhd_tc2(data):
     if len(data) < 32:
         raise ValueError("TC2xx BMHD is 32 bytes")
     word1 = int.from_bytes(data[4:8], "little")   # BMHDID<<16 | BMI
-    return {"stadbm": int.from_bytes(data[0:4], "little"),
+    return {"stad": int.from_bytes(data[0:4], "little"),      # STADABM
             "bmi": word1 & 0xFFFF,
             "bmhdid": (word1 >> 16) & 0xFFFF,
             "chkstart": int.from_bytes(data[8:12], "little"),
@@ -195,25 +210,14 @@ def validate_bmhd_tc2(data, chip=None):
         return False, ["shorter than 32 bytes"]
     header = parse_bmhd_tc2(data)
     problems = []
-    if header["bmhdid"] != BMHDID:
-        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
-    if header["stadbm"] & 0x3:
-        problems.append("STADBM 0x%08X not word-aligned" % header["stadbm"])
-    in_pflash = ((header["stadbm"] & 0xDF000000) == 0x80000000)
-    if chip is not None:
-        in_pflash = any(sl.contains(header["stadbm"]) for sl in chip.slices("pflash"))
-    if not in_pflash:
-        problems.append("STADBM 0x%08X not in program flash" % header["stadbm"])
-    # CRChead covers STADBM..!CRCrange (the first 24 bytes), so it already
+    _check_bmhdid(header, problems)
+    _check_stad(header["stad"], "STADABM", chip, problems)
+    # CRChead covers STADABM..!CRCrange (the first 24 bytes), so it already
     # authenticates the CRCrange/!CRCrange fields; no separate inverted-pair check
     # is needed (both are left 0 when the range check is unused).
     # CRCrange itself covers the user code range, which the header alone cannot
     # recompute.
-    expected = crc32_bmhd(data[0:24])
-    if header["crchead"] != expected:
-        problems.append("CRCHEAD 0x%08X != 0x%08X" % (header["crchead"], expected))
-    if header["crchead_n"] != (~expected & 0xFFFFFFFF):
-        problems.append("CRCHEAD_N invalid")
+    _check_crc(header, "crchead", data[0:24], problems)
     return (not problems), problems
 
 
@@ -235,24 +239,9 @@ def validate_bmhd_tc4(data, addr, chip=None):
         return False, ["shorter than 16 bytes"]
     header = parse_bmhd_tc4(data)
     problems = []
-    if header["bmhdid"] != BMHDID:
-        problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
+    _check_bmhdid(header, problems)
     if header["sal"] != addr:
         problems.append("SAL 0x%08X != header address 0x%08X" % (header["sal"], addr))
-    if header["stad"] & 0x3:
-        problems.append("STAD 0x%08X not word-aligned" % header["stad"])
-    if chip is not None and not any(sl.contains(header["stad"]) for sl in chip.slices("pflash")):
-        problems.append("STAD 0x%08X not in program flash" % header["stad"])
-    expected = crc32_bmhd(data[0:12])
-    if header["crcbmhd"] != expected:
-        problems.append("CRCBMHD 0x%08X != 0x%08X" % (header["crcbmhd"], expected))
+    _check_stad(header["stad"], "STAD", chip, problems, unknown_chip_pflash=False)
+    _check_crc(header, "crcbmhd", data[0:12], problems)
     return (not problems), problems
-
-
-def build_bmhd(stad, hwcfg=HWCFG_FLASH, pindis=0, bmi_high=0, bmi=None):
-    if bmi is None:
-        bmi = (pindis & 1) | ((hwcfg & 0x7) << 1) | ((bmi_high & 0xFFF) << 4)
-    header = (bmi.to_bytes(2, "little") + BMHDID.to_bytes(2, "little")
-              + (stad & 0xFFFFFFFF).to_bytes(4, "little"))
-    crc = crc32_bmhd(header)
-    return header + crc.to_bytes(4, "little") + (~crc & 0xFFFFFFFF).to_bytes(4, "little")

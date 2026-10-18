@@ -1,0 +1,4 @@
+name = "tc27x"
+base = "tc2xx"
+aliases = ["tc270", "tc275", "tc277", "tc27d"]
+id_value = 0x7040
