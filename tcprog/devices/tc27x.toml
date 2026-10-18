@@ -1,4 +1,4 @@
 name = "tc27x"
 base = "tc2xx"
-aliases = ["tc270", "tc275", "tc277", "tc27d"]
+aliases = ["tc270", "tc275", "tc277"]
 id_value = 0x7040

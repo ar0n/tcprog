@@ -1,8 +1,8 @@
 # AURIX TC4xx (3G). There is no SCU_CHIPID; the identity register is CBS_JTAGID at
 # 0xFA180080, and the mask drops its version nibble.
 # Family defaults: a chip file names this file with base = "tc4xx" and may override any
-# key. [memory] is the base map: a chip inherits its ranges, replaces one by giving a
-# range of the same name, and removes one with `name = false`.
+# key. [memory] is the base map: a chip inherits its ranges, overrides keys of one by
+# giving them under the same name, and removes one with `name = false`.
 
 family = "tc4xx"
 id_addr = 0xFA180080

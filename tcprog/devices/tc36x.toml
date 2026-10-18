@@ -8,8 +8,6 @@ id_value = 0x6080
 "6" = [[0xA0000000, 0x200000], [0xA0300000, 0x100000]]
 
 [memory]
-# PFLASH is two 2 MB banks in 3 MB slots, with a reserved gap at 0xA0200000 (not
-# confirmed on silicon).
 pflash0 = { size = 0x200000 }
 pflash1 = { kind = "pflash", base = 0xA0300000, size = 0x200000 }
 dflash0 = { size = 0x20000 }

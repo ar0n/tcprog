@@ -1,10 +1,12 @@
 name = "tc23x"
 base = "tc2xx"
-aliases = ["tc233", "tc234", "tc237", "tc23a"]
+aliases = ["tc233", "tc234", "tc237"]
 id_value = 0x3040
 
 [memory]
 pflash0 = { size = 0x200000 }
 dflash0 = { size = 0x20000 }
+# Assumed absent (a guess): no DF1 (HSM data flash) is documented for TC23x.
+dflash1 = false
 pspr0   = { size = 0x2000 }
 dspr0   = { size = 0x2E000 }

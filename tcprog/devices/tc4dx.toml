@@ -2,5 +2,5 @@
 # 0x10225083 on a TC4D7.
 name = "tc4dx"
 base = "tc4xx"
-aliases = ["tc4d", "tc4d7", "tc4d9"]
+aliases = ["tc4d7", "tc4d9"]
 id_value = 0x10225083

@@ -1,11 +1,11 @@
 # AURIX TC2xx (1G). Flash protection and status are the FLASH0 module, not a DMU. UCBs
 # are 1 KiB; the BMHDs are in PFLASH. tcprog does not write or erase TC2xx flash.
 # Family defaults: a chip file names this file with base = "tc2xx" and may override any
-# key. [memory] is the base map: a chip inherits its ranges, replaces one by giving a
-# range of the same name, and removes one with `name = false`.
+# key. [memory] is the base map: a chip inherits its ranges, overrides keys of one by
+# giving them under the same name, and removes one with `name = false`.
 
-# A part's id_value is matched under id_mask: SCU_CHIPID CHID[15:12] and CHTEC, so
-# any variant, step or microcode version of the series is recognised.
+# A part's id_value is matched under id_mask: the upper nibble of SCU_CHIPID CHID[15:8]
+# and CHTEC, so any variant, step or microcode version of the series is recognised.
 family = "tc2xx"
 id_addr = 0xF0036140
 id_mask = 0x0000F0C0

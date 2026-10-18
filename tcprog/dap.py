@@ -254,22 +254,23 @@ class Dap:
         return None
 
     def write_word(self, addr, value):
-        """Write one 32-bit word (WRITEMEM). Returns the two telegram replies."""
+        """Write one 32-bit word (WRITEMEM)."""
         for tx, nrx in _IO_SELECT:
             self.exchange(tx, nrx)
         head, payload = _writemem_word(addr, value)
-        return self.exchange(head, 7), self.exchange(payload, 2)
+        self.exchange(head, 7)
+        self.exchange(payload, 2)
 
-    def pulse_reset(self, hold=0.010, settle=0.0005):
+    def pulse_reset(self, hold=0.010, settle=0.0):
         """Assert then release the target reset (nSRST).
 
         On the miniWiggler V3, nSRST is ACBUS1, active low: 0x55 asserts, 0x57
         releases. The dialogue has to be entered within a couple of ms of the
         release, so the caller batches the key exchange right after this.
         """
-        self._w(bytes((0x82, _ACBUS_RX & ~0x02, _ACBUS_DIR)))
+        self._w(bytes((0x82, _ACBUS_IDLE_RESET, _ACBUS_DIR)))
         time.sleep(hold)
-        self._w(bytes((0x82, _ACBUS_RX, _ACBUS_DIR)))
+        self._w(bytes((0x82, _ACBUS_IDLE, _ACBUS_DIR)))
         time.sleep(settle)
 
     def _batched(self, steps):
@@ -299,7 +300,7 @@ class Dap:
         exchange rides in one USB transfer (no round trip between the OJCONF
         write and the key word).
         """
-        self.pulse_reset(0.010, 0.0)
+        self.pulse_reset()
         steps = [(_DAPISC16, 5), (_DAPISC48, 5), (_SET_IO_CLIENT, 3), (_READ_IOINFO, 9),
                  (_OJCONF_503, 7), (_comdata_write(CMD_KEY_EXCHANGE), 7)]
         steps += [(_READ_IOINFO, 9)] * 10
@@ -326,7 +327,7 @@ class Dap:
         -> the halted PC, or None if CPU0 did not stay halted. Needs an open debug
         interface after the reset."""
         for _ in range(tries):
-            self.pulse_reset(0.010, 0.0)
+            self.pulse_reset()
             self._batched([(_DAPISC16, 5), (_DAPISC48, 5), (_SET_IO_CLIENT, 3), (_READ_IOINFO, 9),
                            (_OJCONF_HARR, 7), (_READ_IOINFO, 9)])
             time.sleep(0.2)

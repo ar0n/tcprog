@@ -9,6 +9,7 @@ command addresses must use the non-cached 0xA0000000 PFLASH alias.
 import os
 import time
 
+from .chips import _uncached
 from .dap import Dap, DapError
 from .image import (parse_bmhd_tc2, parse_bmhd_tc3, parse_bmhd_tc4,
                     validate_bmhd_tc2, validate_bmhd_tc3, validate_bmhd_tc4)
@@ -42,7 +43,8 @@ _VERIFY_ERASED_C4 = (CMD_VERIFY_ERASED_LSR_C4, CMD_VERIFY_ERASED_WL_C4,
                      CMD_VERIFY_ERASED_PAGE_C4)
 # Fourth-cycle data of Write Page / Write Burst (AA50 address, AA58 0, AAA8
 # 0xA0, AAA8 this value). A burst programs the whole aligned group that Load
-# Page filled; with too little data it programs stale buffer contents.
+# Page filled. With too little data, TC3xx programs the previous contents of
+# the assembly buffer and TC4xx refuses the command (SQER).
 CMD_WRITE_PAGE_C4 = 0xAA
 CMD_WRITE_BURST_C4 = 0xA6
 PFLASH_PAGE, DFLASH_PAGE = 32, 8
@@ -228,7 +230,7 @@ def driven_layout(family):
     """The layout of a family whose flash tcprog drives. TC2xx is not covered
     (FLASH0 FSR layout differs); callers gate on that before asking."""
     if not drives(family):
-        raise DapError("no flash profile for family %r (blank-check covers %s)"
+        raise DapError("no flash profile for family %r; tcprog drives the flash of %s"
                        % (family, " and ".join(DRIVEN)))
     return LAYOUTS[family]
 
@@ -271,15 +273,6 @@ def _ucb_base(chip):
         raise Fail("no UCB region known for this target; pass -c/--chip or --device",
                    os.EX_USAGE)
     return ucb.base
-
-
-def _prog_alias(addr):
-    """Map a cached PFLASH address (0x80000000..0x81FFFFFF) to the non-cached
-    0xA0000000 alias that command parameters must use; DFLASH/UCB addresses are
-    left as-is. TC4D7 PFLASH (20 MB) runs past 0x81000000."""
-    if (addr & 0xFE000000) == 0x80000000:
-        return addr | 0x20000000
-    return addr
 
 
 def _busy_mask(addr, layout):
@@ -418,13 +411,15 @@ class Flash:
     def _wait_page_mode(self, page_addr, timeout=1.0):
         """TC4: wait for HCI_STATUS.PFPAGE/DFPAGE after Enter Page Mode, failing
         early on a sequence/protection error."""
-        bit = HCI_PFPAGE if _is_pflash(_prog_alias(page_addr)) else HCI_DFPAGE
+        bit = HCI_PFPAGE if _is_pflash(page_addr) else HCI_DFPAGE
+
+        def fail_early(_status):
+            self.check_errors("enter page mode at 0x%08X" % page_addr)
         self._poll_status(lambda status: status & bit, "page mode not entered", timeout,
-                          lambda status: self.check_errors("enter page mode at 0x%08X"
-                                                           % page_addr))
+                          fail_early)
 
     def enter_page_mode(self, page_addr):
-        page_addr = _prog_alias(page_addr)
+        page_addr = _uncached(page_addr)
         if _is_pflash(page_addr):
             self._cmd(0x5554, 0x50)                 # program flash
         elif _is_dflash(page_addr, self.layout):
@@ -445,14 +440,14 @@ class Flash:
     def _write(self, addr, cycle4):
         if cycle4 not in (CMD_WRITE_PAGE_C4, CMD_WRITE_BURST_C4):
             raise ValueError("not a Write Page/Burst command: 0x%02X" % cycle4)
-        addr = _prog_alias(addr)
+        addr = _uncached(addr)
         self._cmd(0xAA50, addr)
         self._cmd(0xAA58, 0x00)
         self._cmd(0xAAA8, 0xA0)
         self._cmd(0xAAA8, cycle4)
 
     def erase_sectors(self, sector_addr, count):
-        self._cmd(0xAA50, _prog_alias(sector_addr))
+        self._cmd(0xAA50, _uncached(sector_addr))
         self._cmd(0xAA58, count)
         self._cmd(0xAAA8, 0x80)
         self._cmd(0xAAA8, CMD_ERASE_LSR_C4)
@@ -461,7 +456,7 @@ class Flash:
         """Erase `count` logical sectors of size `sector` from `first`, split
         into commands that stay within ERASE_MAX_* and one bank, each waited for
         and error-checked (EVER = erase verify error)."""
-        if _is_pflash(_prog_alias(first)):
+        if _is_pflash(first):
             limit = ERASE_MAX_PFLASH
         elif _is_ucb(first, self.layout):
             limit = self.layout.ucb_size           # one UCB per command
@@ -541,7 +536,7 @@ class Flash:
         if cycle4 not in _VERIFY_ERASED_C4:
             raise ValueError("not a Verify Erased command: 0x%02X" % cycle4)
         p = self.p
-        addr = _prog_alias(addr)
+        addr = _uncached(addr)
         self._begin_cmd()
         self.clear_errors()
         self._cmd(0xAA50, addr)
@@ -566,7 +561,8 @@ class Flash:
 
     def program_burst(self, burst_addr, burst_bytes):
         """Program one aligned burst (p.pflash_burst / p.dflash_burst bytes). The
-        data must fill the whole burst: a short load programs stale buffer data."""
+        data must fill the whole burst: with a short load TC3xx programs stale
+        buffer data and TC4xx refuses the command."""
         self._program_group(burst_addr, burst_bytes, self.write_burst, "burst")
 
     def _program_group(self, addr, data, write, what):
@@ -637,68 +633,41 @@ def read_region_sparse(dap, addr, length, on_progress=None, on_miss=None):
     (block-aligned addr, bytes) runs of contiguous answered blocks, each cropped
     to the requested [addr, addr+length) window.
 
-    on_progress(done_blocks, total_blocks, kept_bytes) is called as it goes.
-    on_miss(block_addr), if given, is asked for a block that did not answer and
-    returns the [(addr, bytes)] pieces it could still read; such a block is not
-    counted as missed.
+    on_progress(done_blocks) is called as it goes. on_miss(block_addr), if
+    given, is asked for a block that did not answer and returns the
+    [(addr, bytes)] pieces it could still read; such a block is not counted as
+    missed.
     """
     block = Dap.BLOCK
     start, end = _block_span(addr, length)
     block_addrs = list(range(start, end, block))
-    total = len(block_addrs)
-
-    segments = []          # list of [addr, bytearray] contiguous runs
-    kept_bytes = 0
-    missed = 0
-
-    def keep(a, data):
-        nonlocal kept_bytes
-        kept_bytes += len(data)
-        if segments and segments[-1][0] + len(segments[-1][1]) == a:
-            segments[-1][1] += data
-        else:
-            segments.append([a, bytearray(data)])
-
-    i = 0
-    while i < total:
-        n = min(Dap.GROUP, total - i)
-        addrs = block_addrs[i:i + n]
+    found, missed = [], 0
+    for i in range(0, len(block_addrs), Dap.GROUP):
+        addrs = block_addrs[i:i + Dap.GROUP]
         data = None
-        if n > 1:
+        if len(addrs) > 1:
             try:
                 data = dap.read_blocks(addrs)
             except DapError:
                 dap.connect()
-                data = None
-        if data is not None and len(data) == n * block:
-            for j, a in enumerate(addrs):
-                keep(a, data[j * block:(j + 1) * block])
+        if data is not None:
+            found += [(a, data[j * block:(j + 1) * block]) for j, a in enumerate(addrs)]
         else:
             # the group hit a hole: fall back to one block at a time
             for a in addrs:
                 try:
-                    one = dap.read_block(a)
+                    found.append((a, dap.read_block(a)))
                 except DapError:
                     dap.connect()
                     if on_miss is None:
                         missed += 1
                     else:
-                        for piece_addr, piece in on_miss(a):
-                            keep(piece_addr, piece)
-                    continue
-                keep(a, one)
-        i += n
+                        found += on_miss(a)
         if on_progress:
-            on_progress(i, total, kept_bytes)
-
+            on_progress(i + len(addrs))
     lo, hi = addr, addr + length
-    cropped = []
-    for seg_addr, seg_data in segments:
-        a0 = max(seg_addr, lo)
-        a1 = min(seg_addr + len(seg_data), hi)
-        if a1 > a0:
-            cropped.append((a0, bytes(seg_data[a0 - seg_addr:a1 - seg_addr])))
-    return cropped, missed
+    return [(max(a, lo), data[max(a, lo) - a:min(a + len(data), hi) - a])
+            for a, data in _join_segments(found) if max(a, lo) < min(a + len(data), hi)], missed
 
 
 def blankcheck_geometry(chip, addr, length):
@@ -729,9 +698,8 @@ def blank_map(dap, addr, length, chip, sector, on_progress=None):
     Covers TC3xx (2G DMU HF_*) and TC4 (TC4Dx HCI_*) via the family profile.
     Issues only Verify-Erased (non-destructive) sequences.
     """
-    first = addr & ~(sector - 1)
-    last = (addr + length - 1) & ~(sector - 1)
-    sectors = list(range(first, last + 1, sector))
+    first, count = _flash_sectors(addr, length, sector)
+    sectors = range(first, first + count * sector, sector)
     flash = Flash(dap, chip)
     flash.clear_status()
     out = []
@@ -809,7 +777,7 @@ def read_region_blankcheck(dap, addr, length, chip, on_map=None, on_read=None):
     total = sum(hi - lo for lo, hi in windows)
     done = 0                                  # bytes of the windows already read
 
-    def report(blocks, _total, _kept):
+    def report(blocks):
         """read_region_sparse progress for the current window, as bytes of all."""
         on_read(done + min(blocks * Dap.BLOCK, hi - lo), total)
 
@@ -1073,7 +1041,7 @@ def _read_ucbs_tc4(dap, chip):
                             else _confirm_state(words[which]))
         source = _source(codes)
         ucb = codes[source] if source else "ERRORED"
-        entry = {"name": name, "addr": block, "confirm": words["orig"],
+        entry = {"name": name, "addr": block,
                  "state": "ORIG %s, COPY %s -> %s" % (codes["orig"], codes["copy"], ucb),
                  "orig": codes["orig"], "copy": codes["copy"], "orig_word": words["orig"],
                  "copy_word": words["copy"], "source": source,
@@ -1153,7 +1121,13 @@ def _tc3_pair(dap, ucb_base, name, live):
     orig = ucb_base + LAYOUT_TC3XX.ucbs[name] * LAYOUT_TC3XX.ucb_size
     pair = _orig_copy(LAYOUT_TC3XX, orig)
     out = {"name": name, "addr": orig}
-    field = (lambda shift: _PROIN[(live[reg] >> shift) & 3] if live[reg] is not None else None)
+
+    def field(shift):
+        """The live 2-bit PROIN state at `shift` of the confirm register, or None."""
+        if live[reg] is None:
+            return None
+        return _PROIN[(live[reg] >> shift) & 3]
+
     # Protection covers ORIG and COPY together. While the ORIG is valid the
     # COPY is never evaluated and its field stays UNREAD, so the ORIG decides.
     protected = (prodis is not None and "CONFIRMED" in (field(bit), field(bit + 16))
@@ -1214,7 +1188,7 @@ def _read_ucbs_tc3(dap, chip):
             if entry["source"] == "copy":
                 warnings.append("UCB_%s ORIG is %s; the COPY is in use, reprogram the ORIG"
                                 % (entry["name"].upper(), entry["orig"]))
-        entry.update({"confirm": entry["orig_word"], "state": state, "bmhd": None,
+        entry.update({"state": state, "bmhd": None,
                       "problems": problems, "warnings": warnings})
         if entry["name"].startswith("bmhd") and entry["block"] is not None:
             header = _read_header(dap, entry["block"], 16)
@@ -1305,9 +1279,10 @@ def next_boot_report(dap, chip):
 
 
 def _read_ucbs(dap, chip):
-    """Read every known UCB's confirmation word (+ BMHD0 header). -> list of
-    dicts {name, addr, confirm (int|None), state, bmhd (dict|None)}. On TC4xx
-    only the BMHD blocks are known."""
+    """Read and judge the UCBs the startup software evaluates. -> list of dicts
+    {name, addr, state, orig, copy, orig_word, copy_word, source, bmhd}, plus
+    "confirm" (the word, or None) on TC2xx and "problems"/"warnings" on TC3xx
+    and TC4xx. On TC4xx only the BMHD blocks are read."""
     if chip.family == "tc4xx":
         return _read_ucbs_tc4(dap, chip)
     if chip.family == "tc2xx":

@@ -6,8 +6,8 @@ import time
 
 # Exit codes: the standard sysexits.h values via os.EX_* (EX_OK=0, EX_USAGE=64
 # bad args, EX_DATAERR=65 bad image, EX_UNAVAILABLE=69 no probe/target/binding,
-# EX_CANTCREAT=73 output file, EX_IOERR=74 transfer failed, EX_TEMPFAIL=75
-# timeout, EX_NOPERM=77 debug-locked). Only these three have no sysexits
+# EX_CANTCREAT=73 output file, EX_IOERR=74 transfer failed, EX_NOPERM=77
+# debug-locked or password refused). Only these three have no sysexits
 # equivalent (a HIL pipeline keys off them):
 EX_CHECK = 80    # ident --check: detected part != expected
 EX_VERIFY = 81   # read-back verification mismatch

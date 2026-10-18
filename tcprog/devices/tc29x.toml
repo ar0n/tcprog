@@ -1,6 +1,6 @@
 name = "tc29x"
 base = "tc2xx"
-aliases = ["tc297", "tc298", "tc299", "tc29b"]
+aliases = ["tc297", "tc298", "tc299"]
 id_value = 0x9040
 
 [memory]

@@ -1,6 +1,7 @@
 name = "tc39x"
 base = "tc3xx"
-aliases = ["tc397", "tc39xb"]
+aliases = ["tc397"]
+id_value = 0x9080
 
 [memory]
 pflash0 = { size = 0x1000000 }

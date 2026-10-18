@@ -49,7 +49,9 @@ _RANGE_KEYS = {"name", "kind", "base", "size", "_note", "write_protected", "eras
 
 
 def _uncached(addr):
-    """The non-cached (0xA...) address of a cached PFLASH address (0x8...)."""
+    """The non-cached alias (0xA...) of a cached PFLASH address (0x80000000 to
+    0x81FFFFFF), which flash command parameters must use; other addresses are
+    returned as they are. TC4D7 PFLASH (20 MB) runs past 0x81000000."""
     return addr | 0x20000000 if addr & 0xFE000000 == 0x80000000 else addr
 
 
@@ -276,26 +278,6 @@ def load_device_file(path):
             return Chip(_with_base(json.load(handle)))
     with open(path, "rb") as handle:
         return Chip(_with_base(tomllib.load(handle)))
-
-
-def _resolve_chip(args):
-    """Resolve the target from --device (a TOML/JSON file) or --chip (a built-in name).
-
-    -> (chip_or_None, error_or_None). A None chip with no error means neither was
-    given, or `-c auto`, so the caller may still auto-detect from the identity
-    register.
-    """
-    if getattr(args, "device", None):
-        try:
-            return load_device_file(args.device), None
-        except (OSError, ValueError, KeyError) as error:   # TOMLDecodeError is a ValueError
-            return None, "cannot load device file %s: %s" % (args.device, error)
-    if args.chip and args.chip.lower() != "auto":
-        chip = lookup_chip(args.chip)
-        if chip is None:
-            return None, "unknown chip %r (see `tcprog list chips`)" % args.chip
-        return chip, None
-    return None, None
 
 
 def all_chips():

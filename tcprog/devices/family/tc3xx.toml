@@ -1,8 +1,8 @@
 # AURIX TC3xx (2G). DF1 (used by the HSM) is 128 KiB in single-ended mode (64 KiB in
 # complement sensing).
 # Family defaults: a chip file names this file with base = "tc3xx" and may override any
-# key. [memory] is the base map: a chip inherits its ranges, replaces one by giving a
-# range of the same name, and removes one with `name = false`.
+# key. [memory] is the base map: a chip inherits its ranges, overrides keys of one by
+# giving them under the same name, and removes one with `name = false`.
 
 # A part's id_value is matched under id_mask: SCU_CHIPID CHID[15:12] and CHTEC, so
 # any variant, step or microcode version of the series is recognised.

@@ -12,5 +12,6 @@ id_value = 0x3080
 [memory]
 pflash0 = { size = 0x200000 }
 dflash0 = { size = 0x20000 }
+# TC33xEXT parts have 32 KB; the smaller TC33x size is listed.
 pspr0   = { size = 0x2000 }
 dspr0   = { size = 0x30000 }

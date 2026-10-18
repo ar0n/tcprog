@@ -132,19 +132,11 @@ def _check_bmhdid(header, problems):
         problems.append("BMHDID 0x%04X != 0xB359" % header["bmhdid"])
 
 
-def _check_stad(stad, label, chip, problems, unknown_chip_pflash=True):
-    """STAD word-aligned and in the chip's PFLASH. Without a chip, any address
-    in the 0x80000000/0xA0000000 PFLASH segments counts, or (with
-    unknown_chip_pflash False) the PFLASH check is skipped."""
+def _check_stad(stad, label, chip, problems):
+    """STAD word-aligned and in the chip's PFLASH."""
     if stad & 0x3:
         problems.append("%s 0x%08X not word-aligned" % (label, stad))
-    if chip is not None:
-        in_pflash = any(rng.contains(stad) for rng in chip.ranges("pflash"))
-    elif unknown_chip_pflash:
-        in_pflash = (stad & 0xDF000000) == 0x80000000
-    else:
-        in_pflash = True
-    if not in_pflash:
+    if not any(rng.contains(stad) for rng in chip.ranges("pflash")):
         problems.append("%s 0x%08X not in program flash" % (label, stad))
 
 
@@ -170,7 +162,7 @@ def parse_bmhd_tc3(data):
             "crcbmhd_n": int.from_bytes(data[12:16], "little")}
 
 
-def validate_bmhd_tc3(data, chip=None):
+def validate_bmhd_tc3(data, chip):
     problems = []
     if len(data) < 16:
         return False, ["shorter than 16 bytes"]
@@ -194,8 +186,9 @@ def parse_bmhd_tc2(data):
     if len(data) < 32:
         raise ValueError("TC2xx BMHD is 32 bytes")
     word1 = int.from_bytes(data[4:8], "little")   # BMHDID<<16 | BMI
+    bmi = word1 & 0xFFFF
     return {"stad": int.from_bytes(data[0:4], "little"),      # STADABM
-            "bmi": word1 & 0xFFFF,
+            "bmi": bmi, "pindis": (bmi >> 3) & 1, "hwcfg": (bmi >> 4) & 0x7,
             "bmhdid": (word1 >> 16) & 0xFFFF,
             "chkstart": int.from_bytes(data[8:12], "little"),
             "chkend": int.from_bytes(data[12:16], "little"),
@@ -205,13 +198,16 @@ def parse_bmhd_tc2(data):
             "crchead_n": int.from_bytes(data[28:32], "little")}
 
 
-def validate_bmhd_tc2(data, chip=None):
+def validate_bmhd_tc2(data, chip):
     if len(data) < 32:
         return False, ["shorter than 32 bytes"]
     header = parse_bmhd_tc2(data)
     problems = []
     _check_bmhdid(header, problems)
-    _check_stad(header["stad"], "STADABM", chip, problems)
+    # STADABM is the start address of the Alternate Boot Mode only; an internal
+    # start begins at 0xA0000020 whatever STADABM holds.
+    if header["hwcfg"] == HWCFG_ABM:
+        _check_stad(header["stad"], "STADABM", chip, problems)
     # CRChead covers STADABM..!CRCrange (the first 24 bytes), so it already
     # authenticates the CRCrange/!CRCrange fields; no separate inverted-pair check
     # is needed (both are left 0 when the range check is unused).
@@ -234,7 +230,7 @@ def parse_bmhd_tc4(data):
             "crcbmhd": int.from_bytes(data[12:16], "little")}
 
 
-def validate_bmhd_tc4(data, addr, chip=None):
+def validate_bmhd_tc4(data, addr, chip):
     if len(data) < 16:
         return False, ["shorter than 16 bytes"]
     header = parse_bmhd_tc4(data)
@@ -242,6 +238,6 @@ def validate_bmhd_tc4(data, addr, chip=None):
     _check_bmhdid(header, problems)
     if header["sal"] != addr:
         problems.append("SAL 0x%08X != header address 0x%08X" % (header["sal"], addr))
-    _check_stad(header["stad"], "STAD", chip, problems, unknown_chip_pflash=False)
+    _check_stad(header["stad"], "STAD", chip, problems)
     _check_crc(header, "crcbmhd", data[0:12], problems)
     return (not problems), problems

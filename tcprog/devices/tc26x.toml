@@ -1,7 +1,7 @@
 # No DFLASH1 (no HSM).
 name = "tc26x"
 base = "tc2xx"
-aliases = ["tc264", "tc264da", "tc265", "tc267", "tc26b"]
+aliases = ["tc264", "tc264da", "tc265", "tc267"]
 id_value = 0x6040
 
 [memory]

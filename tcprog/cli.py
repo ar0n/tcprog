@@ -11,7 +11,7 @@ import time
 import bincopy
 
 from . import __version__ as VERSION
-from .chips import all_chips, by_id, id_addrs, lookup_chip, _resolve_chip
+from .chips import all_chips, by_id, id_addrs, load_device_file, lookup_chip
 from .dap import (Dap, DapError, SCU_CHIPID, parse_password, parse_probe,
                   _locked, _unlock_failed_msg)
 from .flash import (Flash, ReadFailed, _block_span, _flash_sectors,
@@ -192,8 +192,9 @@ def _decode_chipid(v):
 
 
 def _decode_jtagid(v):
-    """IEEE 1149.1 ID: version, part number, manufacturer (Infineon = 0x083)."""
-    return {"version": (v >> 28) & 0xF, "part": (v >> 12) & 0xFFFF, "manuf": (v >> 1) & 0x7FF}
+    """IEEE 1149.1 ID: version, part number, manufacturer with the fixed lowest
+    bit (Infineon = 0x083)."""
+    return {"version": (v >> 28) & 0xF, "part": (v >> 12) & 0xFFFF, "manuf": v & 0xFFF}
 
 
 # ======================================================================
@@ -406,6 +407,23 @@ def _build_parser():
 # ======================================================================
 # connect / unlock helpers
 # ======================================================================
+def _resolve_chip(args):
+    """The target from --device (a TOML/JSON file) or --chip (a built-in name), or
+    None when neither is given or with `-c auto`, so the caller may still detect
+    it from the identity register. Raises Fail on a bad file or name."""
+    if getattr(args, "device", None):
+        try:
+            return load_device_file(args.device)
+        except (OSError, ValueError, KeyError) as error:   # TOMLDecodeError is a ValueError
+            raise Fail("cannot load device file %s: %s" % (args.device, error), os.EX_USAGE)
+    if args.chip and args.chip.lower() != "auto":
+        chip = lookup_chip(args.chip)
+        if chip is None:
+            raise Fail("unknown chip %r (see `tcprog list chips`)" % args.chip, os.EX_USAGE)
+        return chip
+    return None
+
+
 def _open_dap(args):
     """Open the probe and bring the DAP link up. -> Dap (caller uses `with`).
     Raises Fail on any error, with the right exit code."""
@@ -520,7 +538,6 @@ def _halt_cpu(dap, chip, was_locked):
              "application runs")
     else:
         log("tcprog: CPU0 halted at reset (PC 0x%08X)" % pc, verbose=True)
-    return pc
 
 
 def _after(dap, args, halted):
@@ -528,7 +545,7 @@ def _after(dap, args, halted):
     CPU0 halted."""
     if halted and args.after == "reset":
         try:
-            dap.pulse_reset(0.010, 0.0)
+            dap.pulse_reset()
         except DapError as error:
             warn("could not reset the target afterwards (%s); CPU0 may still be halted, reset "
                  "or power-cycle it" % error)
@@ -603,9 +620,7 @@ def _debug_unlock(dap, args, chip, identity):
 # ======================================================================
 def _cmd_ident(args):
 
-    chip, error = _resolve_chip(args)   # fail fast on a bad --device/--chip
-    if error:
-        return _error(error, os.EX_USAGE)
+    chip = _resolve_chip(args)   # fail fast on a bad --device/--chip
 
     vid, pid, serial = parse_probe(args.probe)
     probe_label = "dap %04x:%04x%s" % (vid, pid, ":" + serial if serial else "")
@@ -741,9 +756,7 @@ def _confirm_json(state, word):
 
 def _cmd_ucb(args):
     action = args.action
-    chip, error = _resolve_chip(args)
-    if error:
-        return _error(error, os.EX_USAGE)
+    chip = _resolve_chip(args)
     dap = _open_dap(args)
     with dap:
         id_addr, chipid = _unlock_if_locked(dap, args, chip)
@@ -791,8 +804,8 @@ def _cmd_ucb(args):
             problems = ["next boot validation: %s" % m for level, m in boot if level == "lockout"]
             for u in ucbs:
                 if "problems" in u:
-                    # TC3xx: judged per ORIG/COPY pair; only the BMHD that
-                    # boots has to be valid.
+                    # TC3xx/TC4xx: judged per ORIG/COPY pair; only the BMHD
+                    # that boots has to be valid. The rest is TC2xx.
                     problems += u["problems"]
                     for warning in u["warnings"]:
                         warn(warning)
@@ -866,7 +879,7 @@ def _read_range(dap, args, chip, addr, length):
     # RAM, CFS) keep the blocks that answer a plain read.
     geometry = blankcheck_geometry(chip, addr, length)
     if geometry is not None:
-        sectors = len(range(addr & ~(geometry[0] - 1), addr + length, geometry[0]))
+        sectors = _flash_sectors(addr, length, geometry[0])[1]
         log("tcprog: %s: blank-checking %d logical sector(s), then reading the programmed "
             "pages" % (where, sectors), verbose=True)
         # The read phase's size is known once the blank-check is done.
@@ -890,7 +903,7 @@ def _read_range(dap, args, chip, addr, length):
     log("tcprog: %s: reading, keeping the blocks that answer" % where, verbose=True)
     with Progress(where + ": read", (end - start) // 1024, " KiB", show) as progress:
         segments, missed = read_region_sparse(
-            dap, addr, length, on_progress=lambda done, total, kept: progress.update(done))
+            dap, addr, length, on_progress=progress.update)
     return segments, [], missed * Dap.BLOCK
 
 
@@ -910,9 +923,7 @@ def _read_failed(chip, addr):
 
 def _cmd_read(args):
 
-    chip, error = _resolve_chip(args)
-    if error:
-        return _error(error, os.EX_USAGE)
+    chip = _resolve_chip(args)
 
     # ranges: explicit --addr/--length, or the whole --region(s) of the chip
     # (named, or detected after connecting)
@@ -987,25 +998,25 @@ def _cmd_read(args):
     # On TC2xx (no flash driver) a block that fails the scan is blank or
     # unreadable. On TC3xx/TC4xx the scan covers only ranges without a
     # blank-check (RAM, CFS), so a failed block there is unreadable.
-    missed_kind = ("unreadable" if chip is not None and drives(chip.family)
-                   else "blank or unreadable")
+    driven = chip is not None and drives(chip.family)
+    missed_kind = "unreadable" if driven else "blank or unreadable"
+    bad = sum(hi - lo for lo, hi in unreadable) + (missed if driven else 0)
     if args.json:
         print(json.dumps({"chip": chip.name if chip else "unknown",
                           "ranges": [{"addr": "0x%08X" % base, "length": size}
                                      for base, size in ranges],
                           "segments": len(segments), "length": data_len,
-                          "unreadable": sum(hi - lo for lo, hi in unreadable)
-                          + (missed if chip is not None and drives(chip.family) else 0),
+                          "unreadable": bad,
                           "format": fmt, "output": args.output or "-",
                           "kib_per_s": round(throughput, 1)}))
     elif not args.quiet:
         # Success is silent; the report comes with -v. Data missing from the
         # image is always reported.
         lines = []
-        for (base, size), (got, bad, _) in zip(ranges if args.skip_blank else [], results):
+        for (base, size), (got, gone, _) in zip(ranges if args.skip_blank else [], results):
             lines.append("tcprog: %s (%s)" % (_range_label(chip, base, size), _size(size)))
             rows = [("segment", lo, len(data)) for lo, data in got]
-            rows += [("unreadable", lo, hi - lo) for lo, hi in bad]
+            rows += [("unreadable", lo, hi - lo) for lo, hi in gone]
             for name, lo, n in sorted(rows, key=lambda row: row[1]):
                 lines.append("  %-10s  0x%08X..0x%08X  %8s" % (name, lo, lo + n, _size(n)))
             if not rows:
@@ -1014,9 +1025,6 @@ def _cmd_read(args):
         if args.skip_blank:
             summary += " in %d segment(s)" % len(segments)
         summary += " at %.1f KiB/s" % throughput
-        bad = sum(hi - lo for lo, hi in unreadable)
-        if missed and missed_kind == "unreadable":
-            bad += missed
         if bad:
             summary += ", %s unreadable" % _size(bad)
         if args.output:
@@ -1147,9 +1155,7 @@ def _cmd_write(args):
     if not args.firmware:
         return _error("no firmware image given; see `tcprog write --help`", os.EX_USAGE)
     auto = (args.chip or "").lower() == "auto" and not args.device
-    chip, error = (None, None) if auto else _resolve_chip(args)
-    if error:
-        return _error(error, os.EX_USAGE)
+    chip = _resolve_chip(args)
     # A write is gated on the target's memory map, so the part is named up front,
     # or detected (-c auto) before anything is planned or written.
     if chip is None and not auto:
@@ -1242,9 +1248,7 @@ def _erase_plan(chip, args):
 
 def _cmd_erase(args):
     auto = (args.chip or "").lower() == "auto" and not args.device
-    chip, error = (None, None) if auto else _resolve_chip(args)
-    if error:
-        return _error(error, os.EX_USAGE)
+    chip = _resolve_chip(args)
     if chip is None and not auto:
         return _error("erase needs the target; pass -c/--chip (or -c auto to detect it) "
                       "or --device FILE", os.EX_USAGE)

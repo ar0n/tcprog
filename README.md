@@ -318,10 +318,8 @@ TC23x register map, and `tc21x` lists no UCB block. `tc49x` lists only UCB0 (the
 UCB1 size is not public), so `write` and `erase` refuse it; `read` works.
 
 On TC35x and TC36x, PFLASH is two 2 MB banks with a reserved gap at
-`0xA0200000`, so the database lists them as two address ranges. The TC3xx user manual
-places each PFLASH bank in a 3 MB slot (PF1 at `0xA0300000`) and shows the gap in
-the TC35x/TC36x alternate map; it is not yet confirmed on silicon. `read
---region pflash` and `erase --region pflash` work bank by bank.
+`0xA0200000`, so the database lists them as two address ranges (PF1 at
+`0xA0300000`). `read --region pflash` and `erase --region pflash` work bank by bank.
 
 Reduced-flash TC3xx variants (for example the 3 MB TC356TD-48F, the 4 MB TC377TX-64F
 or the 8 MB TC387TP-128F) have less PFLASH than their family entry. A part file
