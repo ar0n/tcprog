@@ -19,7 +19,10 @@ Python 3.11 or newer. A Python package: run it from a source checkout with
   not on PyPI; install your distribution's libftdi1 Python bindings.
   `list` and `--dry-run` work without it.
 - The user needs access to the probe's USB device (`058b:0043` for Infineon DAS
-  probes), for example through a udev rule.
+  probes). `udev/60-tcprog.rules` grants it to the logged-in user and the `plugdev`
+  group: copy it to `/etc/udev/rules.d/`, then `udevadm control --reload` and
+  `udevadm trigger` (as root). `list probes` marks a probe without access, and
+  opening one fails with exit 77 and a pointer to the rule.
 
 ```
 python -m tcprog --help
@@ -34,7 +37,9 @@ python -m tcprog write -c tc375 -p 058b:0043:<serial> app.srec
 
 Every command except `list` accepts the [common options](#common-options).
 `--progress` (on `read` and `write`) shows progress on stderr: on a terminal as
-one line updated in place, otherwise (CI logs, pipes) as a plain line every 10 %.
+one line updated in place, otherwise (CI logs, pipes) as a plain line every 10 %,
+plus the current state when a step takes longer than 30 s, so a slow step does not
+look hung. `--progress-interval SECS` changes those 30 s and turns `--progress` on.
 `-v` logs each step (reading, blank-check, erase, programming, verifying) as a
 line of its own instead.
 
@@ -44,8 +49,9 @@ Lists attached FTDI/DAP probes, or the parts `--chip` accepts.
 
 | Option | Meaning |
 |---|---|
-| `probes` | attached FTDI/DAP probes |
-| `chips` | supported parts for `--chip` |
+| `probes` | attached FTDI/DAP probes (marked when the user has no access) |
+| `chips [NAME]` | supported parts for `--chip`; with a NAME, that part's memory map |
+| `--json` | the list as JSON on stdout |
 
 ### ident
 
@@ -78,7 +84,7 @@ file is one flat run of bytes, so whatever lies between the data (blank flash wi
 warning says how much; srec and hex keep only the data.
 `--skip-blank` reads a mostly blank device and keeps only the programmed data:
 on TC3xx/TC4xx PFLASH, DFLASH and UCBs the flash controller's blank-check finds
-the programmed sectors, wordlines and pages, and only those are read; a
+the programmed logical sectors, wordlines and pages, and only those are read; a
 programmed UCB is read whole. A whole TC4D7 PFLASH takes about 13 s, a TC375
 PFLASH about 4 s. Blank DFLASH reads as
 0x00, so this is also what tells blank DFLASH from programmed zeros. Elsewhere
@@ -93,6 +99,7 @@ PFLASH about 4 s. Blank DFLASH reads as
 | `--skip-blank`, `--sparse` | read only the programmed data, skipping blank flash |
 | `--json` | result summary as JSON on stdout |
 | `--progress` | show a progress line |
+| `--progress-interval SECS` | off a terminal, also print the current state when a step takes longer than SECS (default 30); turns on `--progress` |
 
 ### ucb
 
@@ -121,12 +128,12 @@ In the JSON, each UCB has `orig` and `copy` (`{"state": ..., "word": "0x..."}`, 
 
 ### write
 
-Programs an image (requires `-c/--chip`, or `-c auto` to detect the part): erases the covered sectors (PFLASH and
+Programs an image (requires `-c/--chip`, or `-c auto` to detect the part): erases the covered logical sectors (PFLASH and
 DFLASH), programs it, then verifies by reading back. Programming uses the flash
 controller's Write Burst (PFLASH 256 B on TC3xx, 512 B on TC4xx; DFLASH 32 B)
 wherever the image covers a whole aligned burst, and single pages elsewhere. It runs the
 memory-map allowlist and the UCB gate, shows the range, regions (UCBs by name)
-and sector count, and asks before touching flash.
+and logical sector count, and asks before touching flash.
 
 On TC3xx, PFLASH program/erase can be refused while the application runs. For
 PFLASH, `write` and `erase` therefore reset the part with a halt-after-reset
@@ -138,13 +145,15 @@ afterwards so the application restarts (`--after` chooses).
 | `FIRMWARE` | image to write (`.elf` / `.hex` / `.srec` / `.bin`) |
 | `-a`, `--address ADDR` | load address for a raw `.bin` |
 | `--format FMT` | override the image format |
-| `--erase sectors\|none` | erase the covered sectors first (default `sectors`) |
+| `--erase covered\|changed` | `covered` (default): erase and program every logical sector the image covers; `changed`: compare first (blank-check and read) and leave the logical sectors that already hold exactly the image's data alone, neither erased nor programmed |
 | `--no-verify` | skip read-back verification |
 | `--after reset\|no-reset\|halt` | if CPU0 was halted for the operation: restart the application (default) or leave CPU0 halted |
 | `--enable-ucb-write` | allow writing a UCB region |
 | `-n`, `--dry-run` | parse and plan, touch nothing |
 | `-y`, `--yes` | answer yes to the confirmation prompt |
+| `--json` | result summary as JSON on stdout: erase mode, erased, programmed and unchanged ranges, bytes, verify, `--after`, milliseconds |
 | `--progress` | show a progress line |
+| `--progress-interval SECS` | off a terminal, also print the current state when a step takes longer than SECS (default 30); turns on `--progress` |
 
 ### erase
 
@@ -158,12 +167,13 @@ success. Asks before erasing.
 
 | Option | Meaning |
 |---|---|
-| `--addr`, `--length` | range to erase, rounded out to whole sectors |
+| `--addr`, `--length` | range to erase, rounded out to whole logical sectors |
 | `--region NAME[,NAME]` | erase whole address ranges, named as for `read` (needs `--allow-erase-all`) |
 | `--allow-erase-all` | allow erasing a whole region |
 | `--enable-ucb-write` | allow erasing a UCB (only in a device file that does not mark it `erase_protected`) |
 | `--after reset\|no-reset\|halt` | if CPU0 was halted for the operation: restart the application (default) or leave CPU0 halted |
 | `-y`, `--yes` | answer yes to the confirmation prompt |
+| `--json` | result summary as JSON on stdout: erased ranges, logical sector count, milliseconds |
 
 ### Common options
 
@@ -219,7 +229,7 @@ Accepted by `ident`, `read`, `ucb`, `write` and `erase`:
 - `write`, `erase` and `read --skip-blank` read the target's identity first and refuse
   (exit 82) unless the connected silicon is the family `-c` or `--device` names,
   since the flash registers differ per family.
-- `write` and `erase` show the range, regions (UCBs by name) and sector count and
+- `write` and `erase` show the range, regions (UCBs by name) and logical sector count and
   ask before touching flash.
 - `--enable-ucb-write` is required for any write or erase that lands in a UCB
   region; without it the operation is refused (exit 82). A wrong UCB can lock you out of the
@@ -228,7 +238,7 @@ Accepted by `ident`, `read`, `ucb`, `write` and `erase`:
   UCBs that have no password such as the OTP sets, it is permanent.
 - A device-file range marked `write_protected = true` is never programmed or
   erased, and one marked `erase_protected = true` is never left erased: `erase` refuses it,
-  and a write must fill every sector of it that it erases. Refusals exit 82 and
+  and a write must fill every logical sector of it that it erases. Refusals exit 82 and
   no option lifts them. The built-in UCB ranges are erase-protected. See
   "Protected ranges" below.
 - BMHD validation follows the boot mode header checks documented for the startup
@@ -239,7 +249,10 @@ Accepted by `ident`, `read`, `ucb`, `write` and `erase`:
 A command that succeeds prints nothing unless `-v` is given. Diagnostics go to
 stderr as one line each: `tcprog: error: ...` when the command fails,
 `tcprog: refused: ...` when a safety check stops it (exit 82), and
-`tcprog: warning: ...` when it goes on. A reason or hint follows after `; `.
+`tcprog: warning: ...` when it goes on. A reason or hint follows after `; `. When a
+write or erase stops part way (a flash or transport error, or Ctrl-C), the message
+lists the ranges already erased and programmed. Without `-p` serial, more than one
+matching probe is refused (exit 64) instead of opening the first one.
 
 | Code | Name | Meaning |
 |------|------|---------|
@@ -249,10 +262,11 @@ stderr as one line each: `tcprog: error: ...` when the command fails,
 | 69 | `EX_UNAVAILABLE` | no probe/target found, `ftdi1` binding missing, or not supported for this part |
 | 73 | `EX_CANTCREAT`   | cannot write the output file |
 | 74 | `EX_IOERR`       | transfer or flash operation failed |
-| 77 | `EX_NOPERM`      | debug-locked and no / wrong `--debug-unlock-pw`, or a flash-protection password was refused |
+| 77 | `EX_NOPERM`      | debug-locked and no / wrong `--debug-unlock-pw`, a flash-protection password was refused, or no access to the probe's USB device |
 | 80 | `EX_CHECK`       | `ident --check`: detected part != expected |
 | 81 | `EX_VERIFY`      | read-back verification mismatch, or `ucb verify` found a problem |
 | 82 | `EX_REFUSED`     | a destructive op refused for safety (e.g. UCB write without `--enable-ucb-write`) |
+| 130 | interrupted     | Ctrl-C stops at once: a write or erase sends Reset to Read and says what was already erased or programmed; no `--after` reset, so a halted CPU0 stays halted |
 
 ## Device database
 
@@ -284,9 +298,9 @@ A range in a device file can carry one of two flags; `read` ignores both, and no
 option lifts them:
 
 - `write_protected = true`: the range is never changed. `write` refuses image
-  data in it and any sector it would erase there; `erase` refuses it.
+  data in it and any logical sector it would erase there; `erase` refuses it.
 - `erase_protected = true`: `erase` refuses the range, and `write` may rewrite it
-  only with sectors the image fills completely, so no part of it is left erased.
+  only with logical sectors the image fills completely, so no part of it is left erased.
   The built-in device files set it on every UCB range: an erased UCB, or one with
   an erased confirmation code, can lock you out of the part or stop it booting.
 
@@ -350,7 +364,7 @@ Other parts in the device database are untested on silicon.
   unlocked is not known yet, so a debug-locked TC4xx is refused (see [TC4xx](#tc4xx)).
 - **Halting a debug-locked TC3xx** for PFLASH operations: the halt-after-reset
   would lock it again, so it is skipped with a warning.
-- **TC3xx DFLASH in complement-sensing mode** (2 KiB sectors); tcprog assumes the
+- **TC3xx DFLASH in complement-sensing mode** (2 KiB logical sectors); tcprog assumes the
   default single-ended 4 KiB.
 - **On-board debuggers** of the lite kits: they enumerate as DAP probes, but on
   the TC375 kit the reset line is wired differently, so the debug unlock's reset
@@ -384,10 +398,14 @@ Not yet:
     tcprog-cli            run from a checkout without installing
     tcprog/               the package
       cli.py              argparse subcommands + main
+      target.py           connection to the part: open the link, identity, debug unlock, halt, reset
+      preflight.py        write/erase plans and every refusal before the first flash command
       dap.py              DAP transport over the probe's FTDI chip (connect, unlock, read/write)
-      flash.py            flash driver (erase/program/verify), UCB reads, next boot validation
+      flash.py            flash drivers (TC3xx/TC4xx), erase/program/verify, sparse reads, blank-check
+      ucb.py              UCB reads per family, ORIG/COPY judgement, next boot validation
+      bmhd.py             boot mode headers: parse, validate, CRC
       chips.py            device database (Chip, lookup/detect)
-      image.py            firmware image parse/emit + BMHD
+      image.py            firmware image files: load, flat binary, hexdump
       util.py             exit codes, logging, progress output, Fail
       devices/*.toml      device database (memory map + registers, one per part)
       devices/family/     per-family defaults the part files build on

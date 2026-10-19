@@ -25,14 +25,12 @@ def _int(x):
 class MemRange:
     """One address range of the device file. A write-protected range is never
     programmed or erased. An erase-protected range is never left erased: `erase` refuses it,
-    and a write must reprogram every sector of it that it erases. Either may lie
+    and a write must reprogram every logical sector of it that it erases. Either may lie
     inside another range (a boot loader inside PFLASH)."""
-    __slots__ = ("name", "kind", "base", "size", "note", "write_protected",
-                 "erase_protected")
+    __slots__ = ("name", "kind", "base", "size", "write_protected", "erase_protected")
 
-    def __init__(self, name, kind, base, size, note="", write_protected=False,
-                 erase_protected=False):
-        self.name, self.kind, self.base, self.size, self.note = name, kind, base, size, note
+    def __init__(self, name, kind, base, size, write_protected=False, erase_protected=False):
+        self.name, self.kind, self.base, self.size = name, kind, base, size
         self.write_protected, self.erase_protected = write_protected, erase_protected
 
     @property
@@ -48,7 +46,7 @@ class MemRange:
 _RANGE_KEYS = {"name", "kind", "base", "size", "_note", "write_protected", "erase_protected"}
 
 
-def _uncached(addr):
+def noncached_alias(addr):
     """The non-cached alias (0xA...) of a cached PFLASH address (0x80000000 to
     0x81FFFFFF), which flash command parameters must use; other addresses are
     returned as they are. TC4D7 PFLASH (20 MB) runs past 0x81000000."""
@@ -80,7 +78,7 @@ class Chip:
                 raise ValueError("memory range %s: unknown key(s) %s"
                                  % (region.get("name"), ", ".join(sorted(unknown))))
         ranges = [MemRange(region["name"], region.get("kind", ""), _int(region["base"]),
-                           _int(region["size"]), region.get("_note", ""),
+                           _int(region["size"]),
                            bool(region.get("write_protected", False)),
                            bool(region.get("erase_protected", False)))
                   for region in memory]
@@ -99,7 +97,8 @@ class Chip:
         self.asclin_rxdata = _int(spec.get("asclin_rxdata"))
         self.wdt_cpu0con0 = _int(spec.get("wdt_cpu0con0"))
         self.wdt_safcon0 = _int(spec.get("wdt_safcon0"))
-        # Security evaluation: live protection registers.
+        # Live protection registers: PROCONPF/PROCONDF/PROCONDBG for the TC3xx next
+        # boot validation, hf_protect for Disable Protection.
         self.proconpf = _int(spec.get("proconpf"))
         self.procondf = _int(spec.get("procondf"))
         self.procondbg = _int(spec.get("procondbg"))
@@ -175,7 +174,7 @@ class Chip:
         """The first range with `flag` (write_protected or erase_protected) set
         that overlaps [lo, hi), or None. A cached PFLASH address is the same flash
         as its non-cached one, so it is checked there."""
-        lo, hi = _uncached(lo), _uncached(hi - 1) + 1
+        lo, hi = noncached_alias(lo), noncached_alias(hi - 1) + 1
         for region in self.memory:
             if getattr(region, flag) and region.base < hi and lo < region.end:
                 return region
@@ -254,10 +253,10 @@ def lookup_chip(name):
     return None
 
 
-def by_id(value, addr=None):
-    """The chip whose ID register (at `addr`, when given) reads `value`."""
+def by_id(value, addr):
+    """The chip whose ID register at `addr` reads `value`."""
     for chip in _CHIPS.values():
-        if (addr is None or chip.id_addr == addr) and chip.matches_id(value):
+        if chip.id_addr == addr and chip.matches_id(value):
             return chip
     return None
 

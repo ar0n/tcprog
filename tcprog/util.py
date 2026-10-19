@@ -56,25 +56,28 @@ class Fail(Exception):
 class Progress:
     """Progress of a long operation on stderr. On a terminal it is one line
     updated in place; otherwise (CI logs, pipes, files) it prints a plain line at
-    most every 10 % (plus a heartbeat every `interval` seconds on slow steps), so
-    logs stay short and readable.
+    most every 10 %, plus the current state when a step takes longer than
+    `interval` seconds (default HEARTBEAT; --progress-interval), so logs stay
+    short and a slow step does not look hung.
     Shown with --progress; disabled entirely with enabled=False. Use it as a
     context manager so the line is finished on every exit path."""
 
-    def __init__(self, label, total, unit="", enabled=True, interval=30.0):
+    HEARTBEAT = 30.0
+
+    def __init__(self, label, total, unit="", enabled=True, interval=None):
         self.label, self.total, self.unit = label, max(total, 1), unit
         self.enabled = enabled
         self.tty = enabled and sys.stderr.isatty()
-        self.interval = interval
+        self.interval = interval or self.HEARTBEAT
         self._last_time = time.monotonic()
         self._last_step = -1
         self._shown = False
 
-    def update(self, done, extra=""):
+    def update(self, done):
         if not self.enabled:
             return
         pct = min(100, int(done * 100 / self.total))
-        text = "tcprog: %s %d/%d%s (%d%%)%s" % (self.label, done, self.total, self.unit, pct, extra)
+        text = "tcprog: %s %d/%d%s (%d%%)" % (self.label, done, self.total, self.unit, pct)
         if self.tty:
             sys.stderr.write("\r" + text)
             sys.stderr.flush()
@@ -97,3 +100,10 @@ class Progress:
         if self.tty and self._shown:
             sys.stderr.write("\n")
             self._shown = False
+
+
+def _size(n):
+    """A byte count for reports: 256 B, 27 KiB, 1.5 KiB."""
+    if n < 1024:
+        return "%d B" % n
+    return ("%d KiB" % (n // 1024)) if not n % 1024 else ("%.1f KiB" % (n / 1024.0))

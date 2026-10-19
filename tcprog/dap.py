@@ -12,7 +12,9 @@ _ADBUS_VAL, _ADBUS_DIR, _ACBUS_DIR = 0x80, 0xDB, 0xF7
 _ACBUS_IDLE, _ACBUS_IDLE_RESET, _ACBUS_TX, _ACBUS_RX = 0x57, 0x55, 0x67, 0x57
 CMD_WRITEREG, CMD_WRITEMEM, CMD_READMEM, CMD_DAPISC, CMD_READREG, CMD_SET_IO_CLIENT = 8, 9, 10, 17, 26, 28
 REG_READ32 = 0x5
-SCU_CHIPID = 0xF0036140          # target identity register (TC2xx/TC3xx)
+# SCU_CHIPID: read in the captured connect sequence and, after a debug unlock,
+# to prove the debug interface is open.
+SCU_CHIPID = 0xF0036140
 # Block read: the READMEM low byte is (size & 0x3FC) | 1, so a 1024-byte read is
 # 0x400 & 0x3FC = 0 | 1 = 1 (the "IOADDR" selector); its reply is 1228 bytes.
 _REG_BLOCK, _RESP_BLOCK = 0x1, 1228
@@ -23,7 +25,7 @@ class DapError(RuntimeError):
 
 
 def _locked(chipid):
-    """True if SCU_CHIPID could not be read (debug interface closed)."""
+    """True if the identity register could not be read (debug interface closed)."""
     return chipid is None or chipid in (0, 0xFFFFFFFF)
 
 
@@ -114,7 +116,7 @@ _CONNECT = _IO_SELECT + (
 # CMD_KEY_EXCHANGE into the COMDATA mailbox opens it; eight further words are the
 # 256-bit password. Acceptance is proven by a memory read succeeding afterwards,
 # not by any status word (a wrong password also has all eight words taken). The
-# window is short, so callers allow a retry; it usually lands first time.
+# window is short, so callers allow a retry; it usually succeeds on the first attempt.
 CMD_KEY_EXCHANGE = 0x76D6E24A
 REG_COMDATA = 0x4
 IOINFO_DIALOGUE = 0x00380080          # startup software listening for the key
@@ -261,17 +263,17 @@ class Dap:
         self.exchange(head, 7)
         self.exchange(payload, 2)
 
-    def pulse_reset(self, hold=0.010, settle=0.0):
-        """Assert then release the target reset (nSRST).
+    def pulse_reset(self):
+        """Assert the target reset (nSRST) for 10 ms, then release it.
 
         On the miniWiggler V3, nSRST is ACBUS1, active low: 0x55 asserts, 0x57
-        releases. The dialogue has to be entered within a couple of ms of the
-        release, so the caller batches the key exchange right after this.
+        releases. The startup dialogue has to be entered within a couple of ms of
+        the release, so a caller that needs it batches its telegrams right after
+        this.
         """
         self._w(bytes((0x82, _ACBUS_IDLE_RESET, _ACBUS_DIR)))
-        time.sleep(hold)
+        time.sleep(0.010)
         self._w(bytes((0x82, _ACBUS_IDLE, _ACBUS_DIR)))
-        time.sleep(settle)
 
     def _batched(self, steps):
         """Run (telegram, nrx) steps in ONE USB transfer; split the replies.
@@ -319,26 +321,25 @@ class Dap:
         chipid = self.try_read_word(SCU_CHIPID)
         return not _locked(chipid), chipid
 
-    CPU0_PC = 0xF881FE08                    # TC3xx CPU0 core register PC
-
-    def halt_after_reset(self, tries=3):
+    def halt_after_reset(self, pc_reg, tries=3):
         """Reset with a Halt-After-Reset request, so the startup software stops
         CPU0 at the first user-code instruction before the application runs.
-        -> the halted PC, or None if CPU0 did not stay halted. Needs an open debug
-        interface after the reset."""
+        -> the halted PC read twice from `pc_reg`, or None if CPU0 did not stay
+        halted. Needs an open debug interface after the reset."""
         for _ in range(tries):
             self.pulse_reset()
             self._batched([(_DAPISC16, 5), (_DAPISC48, 5), (_SET_IO_CLIENT, 3), (_READ_IOINFO, 9),
                            (_OJCONF_HARR, 7), (_READ_IOINFO, 9)])
             time.sleep(0.2)
             self.connect()
-            first = self.read_word_retry(self.CPU0_PC)
-            if first is not None and first == self.read_word_retry(self.CPU0_PC):
+            first = self.read_word_retry(pc_reg)
+            if first is not None and first == self.read_word_retry(pc_reg):
                 return first
         return None
 
     def unlock(self, words, tries=3, on_attempt=None):
-        """Retry the key exchange until it unlocks. -> (unlocked, chipid, tries).
+        """Retry the key exchange until it unlocks. -> (unlocked, (id_addr, value),
+        tries), the identity as read back after the exchange.
 
         A correct password usually unlocks on the first attempt; an occasional
         miss of the startup window costs a second one. `on_attempt(k, reached, error)`
@@ -358,8 +359,8 @@ class Dap:
             if on_attempt:
                 on_attempt(k, reached, None)
             if ok:
-                return True, chipid, k
-        return False, None, tries
+                return True, (SCU_CHIPID, chipid), k
+        return False, (SCU_CHIPID, None), tries
 
     BLOCK = 1024
     GROUP = 16                              # blocks per USB transfer
